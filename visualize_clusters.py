@@ -156,7 +156,13 @@ def make_visualization(
         labels={"cluster_label": "Кластер"},
     )
     fig.update_traces(marker=dict(size=9, opacity=0.85, line=dict(width=0)))
-    fig.update_layout(legend_title_text="Кластер", legend=dict(itemsizing="constant"))
+    fig.update_layout(
+        legend_title_text="Кластер",
+        legend=dict(itemsizing="constant"),
+        width=1200,
+        height=800,
+        margin=dict(l=60, r=40, t=80, b=80),
+    )
 
     output_html.parent.mkdir(parents=True, exist_ok=True)
     plot_html = fig.to_html(include_plotlyjs="cdn", full_html=False)
@@ -192,6 +198,7 @@ def make_visualization(
         ".section-text{max-width:70em;line-height:1.5;color:#333;}"
         ".projection-meta{max-width:40em;line-height:1.5;color:#333;}"
         ".projection-meta li{margin-bottom:0.3rem;}"
+        ".plot{max-width:1250px;margin:0 auto;}"
         "</style></head><body>"
         "<h1>Интерактивная карта кластеров</h1>"
         "<p class='section-text'>Этот интерактивный отчёт помогает быстро осмотреть распределение роликов по кластерам и "
