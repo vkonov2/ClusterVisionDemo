@@ -12,6 +12,7 @@ import pandas as pd
 import plotly.express as px
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from umap import UMAP
 
 DEFAULT_REDUCED_PATH = Path("data/embeddings/reduced_embeddings.npy")
 DEFAULT_METADATA_CSV = Path("data/embeddings/embeddings_metadata.csv")
@@ -47,6 +48,13 @@ def load_clusters(path: Path) -> Dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _pad_embeddings(embeddings: np.ndarray) -> np.ndarray:
+    pad = np.zeros((embeddings.shape[0], 2), dtype=np.float32)
+    dim = min(2, embeddings.shape[1])
+    pad[:, :dim] = embeddings[:, :dim]
+    return pad
+
+
 def compute_projection(
     embeddings: np.ndarray,
     method: str,
@@ -57,9 +65,10 @@ def compute_projection(
         return np.zeros((0, 2), dtype=np.float32), {"method": method, "params": {}}
 
     if embeddings.shape[1] < 2:
-        pad = np.zeros((embeddings.shape[0], 2), dtype=np.float32)
-        pad[:, : embeddings.shape[1]] = embeddings
-        return pad, {"method": method, "params": {"note": "input_dim<2, zero-padded"}}
+        return _pad_embeddings(embeddings), {
+            "method": method,
+            "params": {"note": "input_dim<2, zero-padded"},
+        }
 
     method = method.lower()
     if method == "pca":
@@ -72,7 +81,13 @@ def compute_projection(
             },
         }
         return coords.astype(np.float32), meta
+
     if method == "tsne":
+        if len(embeddings) < 3:
+            return _pad_embeddings(embeddings), {
+                "method": "tsne",
+                "params": {"note": "n_samples<3, fallback to padded embeddings"},
+            }
         tsne = TSNE(
             n_components=2,
             perplexity=min(perplexity, max(5.0, len(embeddings) / 3)),
@@ -81,7 +96,33 @@ def compute_projection(
             learning_rate="auto",
         )
         coords = tsne.fit_transform(embeddings)
-        return coords.astype(np.float32), {"method": "tsne", "params": {"perplexity": float(tsne.perplexity)}}
+        return coords.astype(np.float32), {
+            "method": "tsne",
+            "params": {"perplexity": float(tsne.perplexity)},
+        }
+
+    if method == "umap":
+        if len(embeddings) < 3:
+            return _pad_embeddings(embeddings), {
+                "method": "umap",
+                "params": {"note": "n_samples<3, fallback to padded embeddings"},
+            }
+        n_neighbors = max(2, min(15, len(embeddings) - 1))
+        umap = UMAP(
+            n_components=2,
+            random_state=random_state,
+            init="spectral",
+            min_dist=0.1,
+            n_neighbors=n_neighbors,
+        )
+        coords = umap.fit_transform(embeddings)
+        return coords.astype(np.float32), {
+            "method": "umap",
+            "params": {
+                "min_dist": float(umap.min_dist),
+                "n_neighbors": int(umap.n_neighbors),
+            },
+        }
 
     raise ProjectionError(f"Unknown projection method: {method}")
 
@@ -103,7 +144,9 @@ def prepare_plot_dataframe(
         raise ValueError(f"Cluster labels missing for indices: {missing[:10]}")
     df["cluster"] = df["cluster"].astype(int)
     df["cluster_display"] = df.apply(
-        lambda row: f"{row['cluster']} — {row['cluster_name']}" if isinstance(row.get("cluster_name"), str) else str(row["cluster"]),
+        lambda row: f"{row['cluster']} — {row['cluster_name']}"
+        if isinstance(row.get("cluster_name"), str)
+        else str(row["cluster"]),
         axis=1,
     )
     return df
@@ -114,7 +157,7 @@ def make_visualization(
     metadata_path: Path,
     cluster_path: Path,
     output_html: Path,
-    method: str,
+    methods: Tuple[str, ...],
     random_state: int | None,
     perplexity: float,
 ) -> Dict[str, object]:
@@ -129,44 +172,55 @@ def make_visualization(
             f"Metadata: {len(df)}, embeddings: {len(embeddings)}"
         )
 
-    coords, projection_meta = compute_projection(embeddings, method=method, random_state=random_state, perplexity=perplexity)
-    df["x"] = coords[:, 0]
-    df["y"] = coords[:, 1]
-    df["cluster_label"] = df["cluster_display"].astype(str)
-
     hover_columns = [
-        col
-        for col in df.columns
-        if col
-        not in {
-            "x",
-            "y",
-            "cluster",
-            "cluster_label",
-            "cluster_display",
-        }
+        col for col in df.columns if col not in {"cluster", "cluster_label", "cluster_display"}
     ]
-    fig = px.scatter(
-        df,
-        x="x",
-        y="y",
-        color="cluster_label",
-        hover_data=hover_columns,
-        title="Кластеризация рекламных роликов",
-        labels={"cluster_label": "Кластер"},
-    )
-    fig.update_traces(marker=dict(size=9, opacity=0.85, line=dict(width=0)))
-    fig.update_layout(
-        legend_title_text="Кластер",
-        legend=dict(itemsizing="constant"),
-        width=1200,
-        height=800,
-        margin=dict(l=60, r=40, t=80, b=80),
-    )
+
+    figures: list[Tuple[str, str, Dict[str, object]]] = []
+    projection_summaries: Dict[str, Dict[str, object]] = {}
+    include_plotly_js = True
+
+    for method in methods:
+        coords, projection_meta = compute_projection(
+            embeddings,
+            method=method,
+            random_state=random_state,
+            perplexity=perplexity,
+        )
+        df_plot = df.copy()
+        df_plot["x"] = coords[:, 0]
+        df_plot["y"] = coords[:, 1]
+        df_plot["cluster_label"] = df_plot["cluster_display"].astype(str)
+
+        fig = px.scatter(
+            df_plot,
+            x="x",
+            y="y",
+            color="cluster_label",
+            hover_data=hover_columns,
+            title="Кластеризация рекламных роликов",
+            labels={"cluster_label": "Кластер"},
+        )
+        fig.update_traces(marker=dict(size=9, opacity=0.85, line=dict(width=0)))
+        fig.update_layout(
+            legend_title_text="Кластер",
+            legend=dict(itemsizing="constant"),
+            width=1200,
+            height=800,
+            margin=dict(l=60, r=40, t=80, b=80),
+        )
+
+        plot_html = fig.to_html(
+            include_plotlyjs="cdn" if include_plotly_js else False,
+            full_html=False,
+        )
+        include_plotly_js = False
+        figures.append((method, plot_html, projection_meta))
+        projection_summaries[method] = projection_meta
 
     output_html.parent.mkdir(parents=True, exist_ok=True)
-    plot_html = fig.to_html(include_plotlyjs="cdn", full_html=False)
-    method_name = "PCA" if projection_meta.get("method") == "pca" else "t-SNE"
+    method_titles = {"pca": "PCA", "umap": "UMAP", "tsne": "t-SNE"}
+    method_list_text = ", ".join(method_titles.get(method, method.upper()) for method in methods)
     description = f"""
     <section>
       <h2>Что показывает визуализация</h2>
@@ -181,40 +235,54 @@ def make_visualization(
       включать/выключать отдельные кластеры через легенду справа.</p>
     </section>
     <section>
-      <h2>О выбранной проекции</h2>
-      <p class='section-text'>Координаты получены с помощью метода {method_name}. Он снижает размерность финальных эмбеддингов до двух компонент,
-      чтобы визуально оценить компактность и разделимость кластеров. Внизу указаны ключевые параметры проекции.</p>
+      <h2>О проекциях</h2>
+      <p class='section-text'>Ниже представлены проекции эмбеддингов — {method_list_text}. Каждая из них по-своему снижает размерность финальных
+      признаков до двух компонент. Сравните диаграммы, чтобы понять, как меняется форма и плотность кластеров в разных
+      методах визуализации.</p>
     </section>
     """
-    projection_info_rows = []
-    for key, value in projection_meta.items():
-        projection_info_rows.append(f"<li><strong>{key}</strong>: {value}</li>")
-    projection_info = "<ul class='projection-meta'>{}</ul>".format("".join(projection_info_rows))
-    html = (
-        "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
-        "<title>Визуализация кластеров рекламных роликов</title>"
-        "<style>body{font-family:Arial,sans-serif;margin:2rem;}h1{margin-bottom:1rem;}"
-        "section{margin-bottom:1.8rem;}"
-        ".section-text{max-width:70em;line-height:1.5;color:#333;}"
-        ".projection-meta{max-width:40em;line-height:1.5;color:#333;}"
-        ".projection-meta li{margin-bottom:0.3rem;}"
-        ".plot{max-width:1250px;margin:0 auto;}"
-        "</style></head><body>"
-        "<h1>Интерактивная карта кластеров</h1>"
-        "<p class='section-text'>Этот интерактивный отчёт помогает быстро осмотреть распределение роликов по кластерам и "
-        "найти интересующие примеры для анализа.</p>"
-        f"{description}"
-        f"<div class='plot'>{plot_html}</div>"
-        "<section><h2>Параметры проекции</h2>"
-        f"<p class='section-text'>Ниже указаны ключевые настройки, использованные при построении двумерного пространства: {method_name}.</p>"
-        f"{projection_info}"
-        "</section>"
-        "</body></html>"
-    )
+
+    projection_sections = []
+    for method, plot_html, projection_meta in figures:
+        method_name = method_titles.get(method, method.upper())
+        projection_info_rows = []
+        for key, value in projection_meta.items():
+            projection_info_rows.append(f"<li><strong>{key}</strong>: {value}</li>")
+        projection_info = "<ul class='projection-meta'>{}</ul>".format("".join(projection_info_rows))
+        projection_sections.append(
+            "<section>"
+            f"<h2>Проекция {method_name}</h2>"
+            f"<p class='section-text'>Координаты получены с помощью метода {method_name}. Сравните форму кластеров с другими"
+            " представлениями, чтобы оценить устойчивость результатов.</p>"
+            f"<div class='plot'>{plot_html}</div>"
+            f"<h3>Параметры {method_name}</h3>"
+            f"<p class='section-text'>Использованные настройки метода {method_name}:</p>"
+            f"{projection_info}"
+            "</section>"
+        )
+
+    html_parts = [
+        "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>",
+        "<title>Визуализация кластеров рекламных роликов</title>",
+        "<style>body{font-family:Arial,sans-serif;margin:2rem;}h1{margin-bottom:1rem;}",
+        "section{margin-bottom:1.8rem;}",
+        ".section-text{max-width:70em;line-height:1.5;color:#333;}",
+        ".projection-meta{max-width:40em;line-height:1.5;color:#333;}",
+        ".projection-meta li{margin-bottom:0.3rem;}",
+        ".plot{max-width:1250px;margin:0 auto;}",
+        "</style></head><body>",
+        "<h1>Интерактивная карта кластеров</h1>",
+        "<p class='section-text'>Этот интерактивный отчёт помогает быстро осмотреть распределение роликов по кластерам и ",
+        "найти интересующие примеры для анализа.</p>",
+        description,
+        "".join(projection_sections),
+        "</body></html>",
+    ]
+    html = "".join(html_parts)
     output_html.write_text(html, encoding="utf-8")
 
     return {
-        "projection": projection_meta,
+        "projections": projection_summaries,
         "output_html": str(output_html),
         "n_items": len(df),
     }
@@ -226,7 +294,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata", type=Path, default=DEFAULT_METADATA_CSV)
     parser.add_argument("--clusters", type=Path, default=DEFAULT_CLUSTER_JSON)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_HTML)
-    parser.add_argument("--method", choices=["pca", "tsne"], default="pca")
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default="pca,umap,tsne",
+        help="Comma-separated list of projection methods to include (choices: pca, umap, tsne)",
+    )
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--perplexity", type=float, default=30.0, help="Perplexity for t-SNE projection")
     return parser.parse_args()
@@ -234,12 +307,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    methods = tuple(method.strip().lower() for method in args.methods.split(",") if method.strip())
+    if not methods:
+        raise ValueError("At least one projection method must be specified")
+
     make_visualization(
         embeddings_path=args.embeddings,
         metadata_path=args.metadata,
         cluster_path=args.clusters,
         output_html=args.output,
-        method=args.method,
+        methods=methods,
         random_state=args.random_state,
         perplexity=args.perplexity,
     )

@@ -13,6 +13,7 @@ tqdm
 yt-dlp
 openpyxl
 scikit-learn
+umap-learn
 plotly>=5.20.0
 
 # --- Аудио + YAMNet ---
