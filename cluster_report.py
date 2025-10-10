@@ -36,6 +36,63 @@ def load_manifest(path: Path) -> Tuple[pd.DataFrame, dict]:
     return frame, manifest
 
 
+def manifest_duplicate_groups(manifest: dict) -> pd.DataFrame:
+    duplicates = manifest.get("duplicates") or []
+    if not duplicates:
+        return pd.DataFrame(columns=["representative_index", "members", "reason", "label", "cluster_name", "slug", "link"])
+
+    entries = manifest.get("entries", [])
+    by_index = {
+        int(entry["index"]): entry
+        for entry in entries
+        if isinstance(entry, dict) and "index" in entry and entry["index"] == entry["index"]
+    }
+
+    rows = []
+    for group in duplicates:
+        rep_idx = int(group.get("representative_index", -1))
+        entry = by_index.get(rep_idx, {})
+        rows.append(
+            {
+                "representative_index": rep_idx,
+                "members": ", ".join(str(int(idx)) for idx in group.get("members", []) if int(idx) != rep_idx),
+                "reason": group.get("reason"),
+                "label": entry.get("label"),
+                "cluster_name": entry.get("cluster_name"),
+                "slug": entry.get("slug"),
+                "link": entry.get("link"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def manifest_noise_entries(manifest: dict) -> pd.DataFrame:
+    noise_indices = manifest.get("noise_indices") or []
+    if not noise_indices:
+        return pd.DataFrame(columns=["index", "label", "cluster_name", "slug", "link"])
+
+    entries = manifest.get("entries", [])
+    by_index = {
+        int(entry["index"]): entry
+        for entry in entries
+        if isinstance(entry, dict) and "index" in entry and entry["index"] == entry["index"]
+    }
+
+    rows = []
+    for idx in noise_indices:
+        entry = by_index.get(int(idx), {})
+        rows.append(
+            {
+                "index": int(idx),
+                "label": entry.get("label"),
+                "cluster_name": entry.get("cluster_name"),
+                "slug": entry.get("slug"),
+                "link": entry.get("link"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def compute_summary(df: pd.DataFrame, manifest: dict, min_cluster_size: int) -> pd.DataFrame:
     summary = df.groupby("label").size().rename("count").reset_index()
     total = summary["count"].sum()
@@ -200,6 +257,18 @@ def build_report(
         parts.append("<p><strong>Evaluated k:</strong><br>{}</p>".format("<br>".join(metrics_rows)))
     if "inertia" in manifest:
         parts.append("<p><strong>Inertia:</strong> {:.4f}</p>".format(manifest["inertia"]))
+    if manifest.get("metrics_plot"):
+        parts.append(
+            "<p><a href='{url}' target='_blank'>Interactive metrics plot</a></p>".format(url=manifest["metrics_plot"])
+        )
+
+    dedup_df = manifest_duplicate_groups(manifest)
+    if not dedup_df.empty:
+        parts.append(render_section("Collapsed duplicates", dataframe_to_html(dedup_df)))
+
+    noise_df = manifest_noise_entries(manifest)
+    if not noise_df.empty:
+        parts.append(render_section("Noise-labelled items", dataframe_to_html(noise_df)))
 
     summary_display = summary.copy()
     summary_display["share"] = summary_display["share"].map(lambda x: f"{x:.4f}")
