@@ -8,6 +8,11 @@ transformers>=4.41.0
 numpy
 opencv-python
 av
+pandas
+tqdm
+yt-dlp
+openpyxl
+scikit-learn
 
 # --- Аудио + YAMNet ---
 tensorflow>=2.15.0

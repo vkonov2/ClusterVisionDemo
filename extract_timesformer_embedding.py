@@ -1,7 +1,9 @@
 import os
+from typing import List, Optional, Sequence
+
+import cv2
 import numpy as np
 import torch
-import cv2
 from transformers import AutoImageProcessor, TimesformerModel
 
 """
@@ -25,7 +27,7 @@ NUM_FRAMES = 16
 def get_device() -> torch.device:
     return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-def sample_frame_indices(n_total: int, n_want: int):
+def sample_frame_indices(n_total: int, n_want: int) -> List[int]:
     if n_total <= 0:
         return []
     if n_total <= n_want:
@@ -36,7 +38,7 @@ def sample_frame_indices(n_total: int, n_want: int):
     lin = np.linspace(0, n_total - 1, n_want)
     return [int(round(x)) for x in lin]
 
-def read_frames_opencv(path: str, num_frames: int):
+def read_frames_opencv(path: str, num_frames: int) -> List[np.ndarray]:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {path}")
@@ -62,42 +64,60 @@ def read_frames_opencv(path: str, num_frames: int):
         frames.append(frames[-1])
     return frames[:num_frames]
 
+def _ensure_batch_dimension(pixel_values: torch.Tensor) -> torch.Tensor:
+    """Приводим форму к [B, T, C, H, W]."""
+
+    if pixel_values.ndim == 4:
+        pixel_values = pixel_values.unsqueeze(0)
+    elif pixel_values.ndim > 5:
+        while pixel_values.ndim > 5:
+            pixel_values = pixel_values.squeeze(0)
+    return pixel_values
+
+
+def extract_timesformer_embedding(
+    video_path: str,
+    num_frames: int = NUM_FRAMES,
+    device: Optional[torch.device] = None,
+    processor: Optional[AutoImageProcessor] = None,
+    model: Optional[TimesformerModel] = None,
+) -> np.ndarray:
+    """Извлекает CLS-эмбеддинг TimeSformer из видео."""
+
+    dev = device or get_device()
+
+    own_processor = processor is None
+    own_model = model is None
+
+    if processor is None:
+        processor = AutoImageProcessor.from_pretrained(MODEL_ID)
+    if model is None:
+        model = TimesformerModel.from_pretrained(MODEL_ID).to(dev)
+        model.eval()
+
+    frames: Sequence[np.ndarray] = read_frames_opencv(video_path, num_frames)
+    proc_out = processor(images=list(frames), return_tensors="pt")
+    pixel_values = _ensure_batch_dimension(proc_out["pixel_values"]).to(dev)
+
+    with torch.no_grad():
+        outputs = model(pixel_values=pixel_values)
+        cls = outputs.last_hidden_state[:, 0, :]
+        emb = torch.nn.functional.normalize(cls, dim=-1).squeeze(0).cpu().numpy()
+
+    if own_model:
+        del model
+    if own_processor:
+        del processor
+
+    return emb.astype(np.float32)
+
+
 def main():
     dev = get_device()
     print("Using device:", dev)
 
-    # 1) Модель и препроцессор
-    processor = AutoImageProcessor.from_pretrained(MODEL_ID)  # у TimeSformer нет fast-версии
-    model = TimesformerModel.from_pretrained(MODEL_ID).to(dev)
-    model.eval()
+    emb = extract_timesformer_embedding(VIDEO_PATH, num_frames=NUM_FRAMES, device=dev)
 
-    # 2) Кадры (список np.ndarray HxWxC, RGB, uint8)
-    frames = read_frames_opencv(VIDEO_PATH, NUM_FRAMES)
-
-    # 3) Препроцессинг
-    proc_out = processor(images=frames, return_tensors="pt")  # обычно [T, C, H, W]
-    pixel_values = proc_out["pixel_values"]
-
-    # Приводим форму к [B, T, C, H, W]:
-    # - если [T, C, H, W] -> добавляем batch
-    # - если [B, T, C, H, W] -> оставляем как есть
-    # - если что-то ещё -> аккуратно выжимаем лишние оси
-    if pixel_values.ndim == 4:
-        pixel_values = pixel_values.unsqueeze(0)
-    elif pixel_values.ndim > 5:
-        # на всякий случай: уберём оси размера 1 сверх нужных
-        while pixel_values.ndim > 5:
-            pixel_values = pixel_values.squeeze(0)
-
-    pixel_values = pixel_values.to(dev)
-
-    # 4) Инференс и CLS-эмбеддинг
-    with torch.no_grad():
-        outputs = model(pixel_values=pixel_values)  # last_hidden_state: [B, T+1, D]
-        cls = outputs.last_hidden_state[:, 0, :]     # [B, D]
-        emb = torch.nn.functional.normalize(cls, dim=-1).squeeze(0).cpu().numpy()
-
-    # 5) Сохранение
     os.makedirs("data/embeddings", exist_ok=True)
     out_path = "data/embeddings/sample_timesformer.npy"
     np.save(out_path, emb)

@@ -15,8 +15,10 @@
 """
 
 import os
-import numpy as np
+from typing import Optional, Tuple
+
 import librosa
+import numpy as np
 import torch
 import tempfile
 import ffmpeg
@@ -65,39 +67,65 @@ def denoise_audio(y: np.ndarray, sr: int, profile_secs: float = 0.5) -> np.ndarr
     y_denoised = nr.reduce_noise(y=y, y_noise=noise_profile, sr=sr, stationary=False)
     return y_denoised.astype(np.float32)
 
+def extract_text_embedding(
+    video_path: str,
+    sample_rate: int = SAMPLE_RATE,
+    noise_profile_secs: float = NOISE_PROFILE_SECS,
+    whisper_model_name: str = WHISPER_MODEL,
+    sentence_model_name: str = SENT_EMB_MODEL,
+    whisper_model: Optional[whisper.Whisper] = None,
+    sentence_model: Optional[SentenceTransformer] = None,
+    denoise: bool = True,
+) -> Tuple[np.ndarray, str]:
+    """Возвращает (эмбеддинг, текст) полученные через Whisper + MiniLM."""
+
+    device_str = get_torch_device_str()
+    y = load_audio_16k_mono(video_path, target_sr=sample_rate)
+
+    if denoise:
+        y_proc = denoise_audio(y, sample_rate, profile_secs=noise_profile_secs)
+    else:
+        y_proc = y
+
+    own_whisper = whisper_model is None
+    if whisper_model is None:
+        whisper_device = "cpu" if device_str == "mps" else device_str
+        whisper_model = whisper.load_model(whisper_model_name, device=whisper_device)
+
+    result = whisper_model.transcribe(y_proc, task="transcribe", fp16=False)
+    text = (result.get("text") or "").strip()
+
+    own_sentence = sentence_model is None
+    if sentence_model is None:
+        sbert_device = "cpu" if device_str == "mps" else device_str
+        sentence_model = SentenceTransformer(sentence_model_name, device=sbert_device)
+
+    if not text:
+        emb = np.zeros((384,), dtype=np.float32)
+    else:
+        emb_vec = sentence_model.encode(text, normalize_embeddings=True)
+        emb = np.asarray(emb_vec, dtype=np.float32)
+
+    if own_sentence:
+        del sentence_model
+    if own_whisper:
+        del whisper_model
+
+    return emb, text
+
+
 def main():
     device_str = get_torch_device_str()
     print("Using device:", device_str)
 
-    # 1) Аудио 16 кГц
-    print("🎧 Извлекаем аудио:", VIDEO_PATH)
-    y = load_audio_16k_mono(VIDEO_PATH, target_sr=SAMPLE_RATE)
-    print("   Длина:", len(y), "сэмплов (~", f"{len(y)/SAMPLE_RATE:.2f}", "сек)")
+    emb, text = extract_text_embedding(
+        VIDEO_PATH,
+        sample_rate=SAMPLE_RATE,
+        noise_profile_secs=NOISE_PROFILE_SECS,
+        whisper_model_name=WHISPER_MODEL,
+        sentence_model_name=SENT_EMB_MODEL,
+    )
 
-    # 2) Подавление шума
-    print("🧹 Подавление шума...")
-    y_clean = denoise_audio(y, SAMPLE_RATE, profile_secs=NOISE_PROFILE_SECS)
-    print("   Готово.")
-
-    # 3) Распознавание Whisper
-    print("🗣️ Распознаём Whisper:", WHISPER_MODEL)
-    whisper_device = "cpu" if device_str == "mps" else device_str   # <<< ключевая строка
-    wmodel = whisper.load_model(WHISPER_MODEL, device=whisper_device)
-    result = wmodel.transcribe(y_clean, task="transcribe", fp16=False)  # fp16=False для CPU/MPS
-    text = (result.get("text") or "").strip()
-    print("   Транскрипт (preview):", text[:120] + ("..." if len(text) > 120 else ""))
-
-    # 4) Текстовый эмбеддинг (all-MiniLM-L6-v2)
-    print("🔤 Эмбеддинг текста:", SENT_EMB_MODEL)
-    sbert = SentenceTransformer(SENT_EMB_MODEL, device=("cpu" if device_str == "mps" else device_str))
-    if not text:
-        print("⚠️ Пустой текст от Whisper; сохраняю нулевой вектор.")
-        emb = np.zeros((384,), dtype=np.float32)
-    else:
-        emb_vec = sbert.encode(text, normalize_embeddings=True)
-        emb = np.asarray(emb_vec, dtype=np.float32)
-
-    # 5) Сохранение
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     if text:
         with open(TRANSCRIPT_TXT, "w", encoding="utf-8") as f:

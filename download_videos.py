@@ -1,0 +1,162 @@
+"""Скачивание рекламных роликов из VideoDataset.xlsx."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
+
+import pandas as pd
+from tqdm import tqdm
+from yt_dlp import YoutubeDL
+
+from pipeline_utils import as_posix, build_video_slug, find_video_file
+
+
+DATASET_PATH = Path("VideoDataset.xlsx")
+OUTPUT_DIR = Path("data/videos")
+MANIFEST_PATH = OUTPUT_DIR / "download_manifest.json"
+
+
+def iter_candidate_sources(row: pd.Series) -> Iterable[str]:
+    sources: List[str] = []
+    seen: set[str] = set()
+
+    def yield_candidate(text: str) -> None:
+        lower = text.lower()
+        if lower.startswith("http"):
+            sources.append(text)
+        elif "youtube" in lower or "youtu.be" in lower:
+            sources.append(text)
+            sources.append(f"ytsearch1:{text}")
+        else:
+            sources.append(f"ytsearch1:{text}")
+
+    def push(value: Optional[str]) -> None:
+        if not isinstance(value, str):
+            return
+        candidate = value.strip()
+        if not candidate or candidate.lower() == "nan":
+            return
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        yield_candidate(candidate)
+
+    push(row.get("link"))
+    push(row.get("mirror"))
+    push(row.get("name"))
+    push(row.get("extra"))
+    if not sources:
+        sources.append(f"ytsearch1:video {row.name}")
+    return sources
+
+
+def ensure_output_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def download_single_video(slug: str, sources: Iterable[str], output_dir: Path) -> Dict[str, str]:
+    outtmpl = (output_dir / f"{slug}.%(ext)s").as_posix()
+    ydl_opts = {
+        "outtmpl": outtmpl,
+        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b/best",
+        "merge_output_format": "mp4",
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }
+        ],
+        "noplaylist": True,
+        "ignoreerrors": False,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch",
+    }
+
+    last_error: Optional[str] = None
+    for source in sources:
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(source, download=True)
+                if info is None:
+                    last_error = f"Empty info for {source}"
+                    continue
+                filename = Path(ydl.prepare_filename(info))
+                return {
+                    "status": "downloaded",
+                    "source": source,
+                    "title": info.get("title"),
+                    "duration": info.get("duration"),
+                    "filepath": as_posix(filename),
+                }
+        except Exception as exc:  # yt-dlp raises различное
+            last_error = str(exc)
+            continue
+
+    return {"status": "failed", "error": last_error or "unknown", "source": None, "filepath": None}
+
+
+def main(dataset: Path = DATASET_PATH, output_dir: Path = OUTPUT_DIR, manifest_path: Path = MANIFEST_PATH) -> int:
+    ensure_output_dir(output_dir)
+
+    df = pd.read_excel(dataset)
+    entries: List[Dict] = []
+
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Download videos"):
+        slug = build_video_slug(idx, row.get("name"), row.get("link"))
+        record: Dict[str, object] = {
+            "index": int(idx),
+            "slug": slug,
+            "link": row.get("link"),
+            "mirror": row.get("mirror"),
+            "name": row.get("name"),
+        }
+
+        existing_path = find_video_file(output_dir, slug)
+
+        if existing_path is not None:
+            record.update({
+                "status": "exists",
+                "filepath": as_posix(existing_path),
+                "source": None,
+            })
+            entries.append(record)
+            continue
+
+        sources = iter_candidate_sources(row)
+        result = download_single_video(slug, sources, output_dir)
+        if result.get("status") == "downloaded":
+            final_path = find_video_file(output_dir, slug)
+            if final_path is not None:
+                result["filepath"] = as_posix(final_path)
+        record.update(result)
+        entries.append(record)
+
+    manifest = {
+        "dataset": as_posix(dataset),
+        "output_dir": as_posix(output_dir),
+        "entries": entries,
+    }
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Manifest saved to {manifest_path}")
+
+    failed = sum(1 for e in entries if e.get("status") == "failed")
+    print(f"Downloaded {len(entries) - failed} videos, failed: {failed}")
+    return 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Download videos listed in VideoDataset.xlsx")
+    parser.add_argument("--dataset", type=Path, default=DATASET_PATH)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    args = parser.parse_args()
+
+    sys.exit(main(args.dataset, args.output_dir, args.manifest))
+
