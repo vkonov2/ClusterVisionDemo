@@ -216,8 +216,9 @@ def detect_outliers(
     return out_df.sort_values("z_score", ascending=False).reset_index(drop=True)
 
 
-def render_section(title: str, body: str) -> str:
-    return f"<section><h2>{title}</h2>{body}</section>"
+def render_section(title: str, body: str, description: str | None = None) -> str:
+    desc_html = f"<p class='section-description'>{description}</p>" if description else ""
+    return f"<section><h2>{title}</h2>{desc_html}{body}</section>"
 
 
 def dataframe_to_html(df: pd.DataFrame, classes: Iterable[str] | None = None) -> str:
@@ -242,13 +243,22 @@ def build_report(
         "table{border-collapse:collapse;margin-bottom:2rem;}",
         "th,td{border:1px solid #ddd;padding:0.4rem 0.6rem;}",
         "th{background:#f0f0f0;}",
+        ".intro{max-width:65em;line-height:1.5;}",
+        ".section-description{color:#555;max-width:65em;line-height:1.45;margin:0.3rem 0 0.9rem;}",
         "h1,h2{margin-top:1.2rem;}",
         "section{margin-bottom:2.4rem;}",
         "</style></head><body>",
     ]
     parts.append("<h1>Cluster report</h1>")
-    parts.append("<p><strong>Algorithm:</strong> {}</p>".format(manifest.get("algorithm", "unknown")))
-    parts.append("<p><strong>n_clusters:</strong> {}</p>".format(manifest.get("n_clusters", "?")))
+    parts.append(
+        "<p class='intro'>Этот отчёт подробно описывает результаты кластеризации рекламных роликов. "
+        "Ниже можно увидеть использованный алгоритм, параметры подбора k, сжатую статистику по каждому кластеру, "
+        "а также подозрительные случаи: дубликаты, выбросы и элементы, помеченные как шум.</p>"
+    )
+    parts.append(
+        "<p><strong>Алгоритм:</strong> {}</p>".format(manifest.get("algorithm", "unknown"))
+    )
+    parts.append("<p><strong>Количество кластеров (k):</strong> {}</p>".format(manifest.get("n_clusters", "?")))
     if "evaluation" in manifest and manifest["evaluation"]:
         metrics_rows = [
             "k={k} silhouette={silhouette!s} davies_bouldin={davies_bouldin!s} inertia={inertia!s}".format(**row)
@@ -264,34 +274,73 @@ def build_report(
 
     dedup_df = manifest_duplicate_groups(manifest)
     if not dedup_df.empty:
-        parts.append(render_section("Collapsed duplicates", dataframe_to_html(dedup_df)))
+        parts.append(
+            render_section(
+                "Схлопнутые дубликаты",
+                dataframe_to_html(dedup_df),
+                "Группы роликов, которые были объединены в процессе подготовки данных. "
+                "В таблице указан представитель группы, остальные элементы приведены в столбце members.",
+            )
+        )
 
     noise_df = manifest_noise_entries(manifest)
     if not noise_df.empty:
-        parts.append(render_section("Noise-labelled items", dataframe_to_html(noise_df)))
+        parts.append(
+            render_section(
+                "Объекты, помеченные как шум",
+                dataframe_to_html(noise_df),
+                "Эти ролики были определены алгоритмом DBSCAN как выбросы и не участвовали в построении центроидов кластеров.",
+            )
+        )
 
     summary_display = summary.copy()
     summary_display["share"] = summary_display["share"].map(lambda x: f"{x:.4f}")
     summary_display["percentage"] = summary_display["percentage"].map(lambda x: f"{x:.2f}%")
     column_order = ["label", "cluster_name", "count", "percentage", "share", "is_small"]
     summary_display = summary_display[[col for col in column_order if col in summary_display.columns]]
-    parts.append(render_section("Cluster summary", dataframe_to_html(summary_display)))
+    parts.append(
+        render_section(
+            "Сводная статистика кластеров",
+            dataframe_to_html(summary_display),
+            "Основные метрики по каждому кластеру: размер, доля выборки и признак того, считается ли кластер малочисленным.",
+        )
+    )
 
     if not small_clusters.empty:
         parts.append(
             render_section(
-                "Small clusters", dataframe_to_html(small_clusters[[c for c in column_order if c in small_clusters.columns]])
+                "Малочисленные кластеры",
+                dataframe_to_html(small_clusters[[c for c in column_order if c in small_clusters.columns]]),
+                "Кластеры, чей размер не превышает заданного порога. Их стоит проверить на предмет шума или редких сценариев.",
             )
         )
 
     if not duplicate_links.empty:
-        parts.append(render_section("Duplicate links", dataframe_to_html(duplicate_links)))
+        parts.append(
+            render_section(
+                "Совпадающие ссылки",
+                dataframe_to_html(duplicate_links),
+                "Ролики с идентичными ссылками YouTube — вероятные точные дубликаты в исходном датасете.",
+            )
+        )
 
     if not embedding_duplicates.empty:
-        parts.append(render_section("Near-duplicate embeddings", dataframe_to_html(embedding_duplicates)))
+        parts.append(
+            render_section(
+                "Близкие по эмбеддингам ролики",
+                dataframe_to_html(embedding_duplicates),
+                "Пары роликов внутри кластера, у которых косинусное расстояние между эмбеддингами ниже выбранного порога.",
+            )
+        )
 
     if not outliers.empty:
-        parts.append(render_section("Potential outliers", dataframe_to_html(outliers)))
+        parts.append(
+            render_section(
+                "Потенциальные выбросы",
+                dataframe_to_html(outliers),
+                "Участники кластеров, которые заметно удалены от центров (по z-оценке расстояния). Рекомендуется проверить содержимое роликов.",
+            )
+        )
 
     for label, group in sorted(df.groupby("label"), key=lambda item: item[0]):
         display_group = group.drop(columns=["_row"], errors="ignore")
@@ -299,7 +348,19 @@ def build_report(
             group_sorted = display_group.sort_values(by="index")
         else:
             group_sorted = display_group
-        parts.append(render_section(f"Cluster {label}", dataframe_to_html(group_sorted)))
+        cluster_name = manifest.get("cluster_names", {}).get(str(int(label)))
+        description = "Полный список роликов, отнесённых к кластеру. Наведите на ссылку или slug, чтобы перейти к исходным данным."
+        if cluster_name:
+            description = (
+                f"Кластер «{cluster_name}». {description}"
+            )
+        parts.append(
+            render_section(
+                f"Кластер {label}",
+                dataframe_to_html(group_sorted),
+                description,
+            )
+        )
 
     parts.append("</body></html>")
     return "".join(parts)

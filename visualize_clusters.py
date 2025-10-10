@@ -159,7 +159,52 @@ def make_visualization(
     fig.update_layout(legend_title_text="Кластер", legend=dict(itemsizing="constant"))
 
     output_html.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(output_html, include_plotlyjs="cdn")
+    plot_html = fig.to_html(include_plotlyjs="cdn", full_html=False)
+    method_name = "PCA" if projection_meta.get("method") == "pca" else "t-SNE"
+    description = f"""
+    <section>
+      <h2>Что показывает визуализация</h2>
+      <p class='section-text'>Каждая точка — отдельный рекламный ролик. Положение точки на плоскости отражает сходство эмбеддингов:
+      чем ближе две точки, тем больше похожи их визуальные, аудио- и текстовые характеристики. Цвет обозначает кластер,
+      присвоенный алгоритмом кластеризации.</p>
+    </section>
+    <section>
+      <h2>Как взаимодействовать с графиком</h2>
+      <p class='section-text'>Наведите курсор на точку, чтобы увидеть подробные метаданные: название, ссылку, кластер,
+      текстовую расшифровку и другие поля из манифеста. Можно увеличивать/перемещать область просмотра и
+      включать/выключать отдельные кластеры через легенду справа.</p>
+    </section>
+    <section>
+      <h2>О выбранной проекции</h2>
+      <p class='section-text'>Координаты получены с помощью метода {method_name}. Он снижает размерность финальных эмбеддингов до двух компонент,
+      чтобы визуально оценить компактность и разделимость кластеров. Внизу указаны ключевые параметры проекции.</p>
+    </section>
+    """
+    projection_info_rows = []
+    for key, value in projection_meta.items():
+        projection_info_rows.append(f"<li><strong>{key}</strong>: {value}</li>")
+    projection_info = "<ul class='projection-meta'>{}</ul>".format("".join(projection_info_rows))
+    html = (
+        "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
+        "<title>Визуализация кластеров рекламных роликов</title>"
+        "<style>body{font-family:Arial,sans-serif;margin:2rem;}h1{margin-bottom:1rem;}"
+        "section{margin-bottom:1.8rem;}"
+        ".section-text{max-width:70em;line-height:1.5;color:#333;}"
+        ".projection-meta{max-width:40em;line-height:1.5;color:#333;}"
+        ".projection-meta li{margin-bottom:0.3rem;}"
+        "</style></head><body>"
+        "<h1>Интерактивная карта кластеров</h1>"
+        "<p class='section-text'>Этот интерактивный отчёт помогает быстро осмотреть распределение роликов по кластерам и "
+        "найти интересующие примеры для анализа.</p>"
+        f"{description}"
+        f"<div class='plot'>{plot_html}</div>"
+        "<section><h2>Параметры проекции</h2>"
+        f"<p class='section-text'>Ниже указаны ключевые настройки, использованные при построении двумерного пространства: {method_name}.</p>"
+        f"{projection_info}"
+        "</section>"
+        "</body></html>"
+    )
+    output_html.write_text(html, encoding="utf-8")
 
     return {
         "projection": projection_meta,

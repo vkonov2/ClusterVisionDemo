@@ -553,8 +553,8 @@ def render_metrics_plot(
     fig.add_trace(go.Scatter(x=ks, y=silhouette, mode="lines+markers", name="Silhouette"))
     fig.add_trace(go.Scatter(x=ks, y=davies, mode="lines+markers", name="Davies-Bouldin", yaxis="y2"))
     fig.update_layout(
-        title="Clustering metrics across k",
-        xaxis_title="k",
+        title="Динамика метрик качества кластеризации",
+        xaxis_title="Количество кластеров (k)",
         yaxis=dict(title="Silhouette", range=[min((v for v in silhouette if v is not None), default=0), 1.0]),
         yaxis2=dict(
             title="Davies-Bouldin",
@@ -562,9 +562,40 @@ def render_metrics_plot(
             side="right",
             range=[min((v for v in davies if v is not None), default=0), max((v for v in davies if v is not None), default=1)],
         ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
+        margin=dict(t=80, r=40, b=60, l=70),
     )
     ensure_parent(output_path)
-    fig.write_html(output_path, include_plotlyjs="cdn")
+    plot_html = fig.to_html(include_plotlyjs="cdn", full_html=False)
+    description = """
+    <section>
+      <h2>Как читать график</h2>
+      <p class='section-text'>На графике сопоставлены две метрики разделимости кластеров при разных значениях k.
+      Линия <strong>Silhouette</strong> показывает, насколько хорошо объекты отделены друг от друга (чем выше, тем лучше),
+      а кривая <strong>Davies-Bouldin</strong> отражает компактность кластеров (чем ниже, тем лучше).
+      Наведите курсор на точки, чтобы увидеть точные значения для каждого k.</p>
+    </section>
+    <section>
+      <h2>Рекомендации по выбору k</h2>
+      <p class='section-text'>Ищите локальные максимумы силуэта и минимумы Davies–Bouldin — такие точки обычно соответствуют
+      устойчивым и интерпретируемым кластерам. Также полезно сопоставить выбранное k с содержанием роликов из отчётов.</p>
+    </section>
+    """
+    html = (
+        "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
+        "<title>Метрики кластеризации</title>"
+        "<style>body{font-family:Arial,sans-serif;margin:2rem;}h1{margin-bottom:1rem;}"
+        "section{margin-bottom:1.8rem;}"
+        ".section-text{max-width:70em;line-height:1.5;color:#333;}"
+        "</style></head><body>"
+        "<h1>Метрики качества кластеризации</h1>"
+        "<p class='section-text'>Этот отчёт помогает оценить, насколько удачно выбран параметр k для KMeans. "
+        "Используйте график ниже, чтобы быстро сравнить варианты и зафиксировать оптимальный диапазон.</p>"
+        f"{description}"
+        f"<div class='plot'>{plot_html}</div>"
+        "</body></html>"
+    )
+    output_path.write_text(html, encoding="utf-8")
     return True
 
 
