@@ -47,22 +47,51 @@ def read_frames_opencv(path: str, num_frames: int) -> List[np.ndarray]:
         raise RuntimeError("Cannot read frame count")
 
     idxs = sample_frame_indices(total, num_frames)
-    frames = []
-    for idx in idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame_bgr = cap.read()
-        if not ok or frame_bgr is None:
+    if not idxs:
+        raise RuntimeError("No frame indices requested")
+
+    frames: List[Optional[np.ndarray]] = [None] * len(idxs)
+    next_ptr = 0
+    target_idx = idxs[next_ptr]
+    frame_no = 0
+
+    while True:
+        if not cap.grab():
+            break
+
+        if frame_no == target_idx:
+            ok, frame_bgr = cap.retrieve()
+            if not ok or frame_bgr is None:
+                cap.release()
+                raise RuntimeError(f"Failed to decode frame {frame_no}")
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frames[next_ptr] = frame_rgb
+            next_ptr += 1
+
+            while next_ptr < len(idxs) and idxs[next_ptr] == frame_no:
+                frames[next_ptr] = frame_rgb
+                next_ptr += 1
+
+            if next_ptr >= len(idxs):
+                break
+            target_idx = idxs[next_ptr]
+
+        frame_no += 1
+        if frame_no > target_idx and next_ptr < len(idxs):
+            # Seek forward by reading additional frames until we reach the target.
+            # cap.grab advances by one frame; the loop will handle further grabs.
             continue
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        frames.append(frame_rgb)
+
     cap.release()
 
-    if not frames:
+    valid_frames = [f for f in frames if f is not None]
+    if not valid_frames:
         raise RuntimeError("No frames decoded")
 
-    while len(frames) < num_frames:
-        frames.append(frames[-1])
-    return frames[:num_frames]
+    while len(valid_frames) < num_frames:
+        valid_frames.append(valid_frames[-1])
+
+    return valid_frames[:num_frames]
 
 def _ensure_batch_dimension(pixel_values: torch.Tensor) -> torch.Tensor:
     """Приводим форму к [B, T, C, H, W]."""
