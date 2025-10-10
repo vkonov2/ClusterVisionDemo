@@ -45,6 +45,7 @@ VIDEO_DIR = Path("data/videos")
 EMBEDDINGS_DIR = Path("data/embeddings")
 PIPELINE_MANIFEST = EMBEDDINGS_DIR / "pipeline_manifest.json"
 CONCAT_PATH = EMBEDDINGS_DIR / "concatenated_embeddings.npy"
+SCALED_PATH = EMBEDDINGS_DIR / "scaled_embeddings.npy"
 REDUCED_PATH = EMBEDDINGS_DIR / "reduced_embeddings.npy"
 METADATA_CSV = EMBEDDINGS_DIR / "embeddings_metadata.csv"
 
@@ -304,10 +305,44 @@ def run_pipeline(
         metadata_rows.append({"index": idx, "slug": slug, **row.to_dict()})
         pipeline_entries.append(entry_meta)
 
-    matrix = np.stack(concatenated) if concatenated else np.zeros((0, sum(EXPECTED_DIMENSIONS.values())), dtype=np.float32)
+    matrix = (
+        np.stack(concatenated)
+        if concatenated
+        else np.zeros((0, sum(EXPECTED_DIMENSIONS.values())), dtype=np.float32)
+    )
     np.save(CONCAT_PATH, matrix)
 
-    reduced, reduction_meta = reduce_embeddings(matrix, source_slices)
+    scaling_info: Dict[str, Dict[str, float]] = {}
+    if matrix.size:
+        modality_norms: Dict[str, float] = {}
+        for name, (start, end) in source_slices.items():
+            slice_view = matrix[:, start:end]
+            norms = np.linalg.norm(slice_view, axis=1)
+            mean_norm = float(np.mean(norms)) if len(norms) else 0.0
+            modality_norms[name] = mean_norm
+
+        valid_norms = [value for value in modality_norms.values() if value > 0]
+        target_norm = float(np.mean(valid_norms)) if valid_norms else 1.0
+        target_norm = target_norm or 1.0
+
+        scaled_matrix = matrix.copy()
+        for name, (start, end) in source_slices.items():
+            mean_norm = modality_norms.get(name, 0.0)
+            if mean_norm > 0:
+                weight = target_norm / mean_norm
+            else:
+                weight = 1.0
+            scaled_matrix[:, start:end] *= weight
+            scaling_info[name] = {"mean_norm": mean_norm, "weight": weight}
+    else:
+        scaled_matrix = matrix
+
+    if scaled_matrix.size:
+        np.save(SCALED_PATH, scaled_matrix)
+    else:
+        SCALED_PATH.write_text("[]", encoding="utf-8")
+
+    reduced, reduction_meta = reduce_embeddings(scaled_matrix, source_slices)
     if reduced.size:
         np.save(REDUCED_PATH, reduced)
     else:
@@ -324,7 +359,9 @@ def run_pipeline(
         "entries": pipeline_entries,
         "reduction": reduction_meta,
         "concatenated_path": as_posix(CONCAT_PATH),
+        "scaled_path": as_posix(SCALED_PATH) if scaled_matrix.size else None,
         "reduced_path": as_posix(REDUCED_PATH) if reduced.size else None,
+        "modality_scaling": scaling_info,
     }
     PIPELINE_MANIFEST.write_text(json.dumps(pipeline_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 

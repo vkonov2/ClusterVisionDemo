@@ -1,4 +1,4 @@
-"""Визуализация кластеризации видеороликов на плоскости."""
+"""Interactive visualization for clustered video embeddings."""
 
 from __future__ import annotations
 
@@ -94,12 +94,18 @@ def prepare_plot_dataframe(
         raise ValueError("Cluster manifest does not contain entries")
     entries = cluster_manifest["entries"]
     label_map = {int(entry["index"]): int(entry["label"]) for entry in entries}
+    name_map = {int(entry["index"]): entry.get("cluster_name") for entry in entries}
     df = metadata.copy()
     df["cluster"] = df["index"].map(label_map)
+    df["cluster_name"] = df["index"].map(name_map)
     if df["cluster"].isna().any():
         missing = df[df["cluster"].isna()]["index"].tolist()
         raise ValueError(f"Cluster labels missing for indices: {missing[:10]}")
     df["cluster"] = df["cluster"].astype(int)
+    df["cluster_display"] = df.apply(
+        lambda row: f"{row['cluster']} — {row['cluster_name']}" if isinstance(row.get("cluster_name"), str) else str(row["cluster"]),
+        axis=1,
+    )
     return df
 
 
@@ -126,9 +132,20 @@ def make_visualization(
     coords, projection_meta = compute_projection(embeddings, method=method, random_state=random_state, perplexity=perplexity)
     df["x"] = coords[:, 0]
     df["y"] = coords[:, 1]
-    df["cluster_label"] = df["cluster"].astype(str)
+    df["cluster_label"] = df["cluster_display"].astype(str)
 
-    hover_columns = [col for col in df.columns if col not in {"x", "y", "cluster", "cluster_label"}]
+    hover_columns = [
+        col
+        for col in df.columns
+        if col
+        not in {
+            "x",
+            "y",
+            "cluster",
+            "cluster_label",
+            "cluster_display",
+        }
+    ]
     fig = px.scatter(
         df,
         x="x",
