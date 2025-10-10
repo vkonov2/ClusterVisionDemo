@@ -13,6 +13,7 @@ tqdm
 yt-dlp
 openpyxl
 scikit-learn
+plotly>=5.20.0
 
 # --- Аудио + YAMNet ---
 tensorflow>=2.15.0
