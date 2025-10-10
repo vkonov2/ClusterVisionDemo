@@ -4,9 +4,23 @@ import torch
 import cv2
 from transformers import AutoImageProcessor, TimesformerModel
 
+"""
+🎬 extract_timesformer_embedding.py → TimeSformer
+    Модель: facebook/timesformer-base-finetuned-k400
+    Вход: последовательность кадров (видео)
+    Выход: last_hidden_state формы [B, T+1, D], где
+        T — число патчей (временных окон),
+        D = 768 — размерность признаков.
+        CLS-токен outputs.last_hidden_state[:, 0, :] и нормализуем.
+    📘 Результат:
+        E_video,
+        размерность: 768,
+        содержит видеопризнаки, захватывающие пространственно-временные паттерны: движения, сцены, объекты, контекст.
+"""
+
 VIDEO_PATH = "data/videos/sample.mp4"
 MODEL_ID = "facebook/timesformer-base-finetuned-k400"
-NUM_FRAMES = 16  # равномерная выборка по всей длительности
+NUM_FRAMES = 16
 
 def get_device() -> torch.device:
     return torch.device("mps" if torch.backends.mps.is_available() else "cpu")

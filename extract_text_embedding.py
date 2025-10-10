@@ -1,20 +1,18 @@
-# extract_text_embedding.py
-# Конвейер:
-#  - извлекаем аудио 16 кГц
-#  - подавляем шум (noisereduce)
-#  - распознаём речь Whisper -> текст
-#  - получаем текстовый эмбеддинг через sentence-transformers/all-MiniLM-L6-v2
-#  - сохраняем E_text и (опционально) транскрипт
-#
-# Зависимости:
-#   pip install torch librosa soundfile ffmpeg-python noisereduce scipy
-#   pip install openai-whisper
-#   pip install sentence-transformers
-#   sudo apt install ffmpeg  # или brew install ffmpeg
-#
-# Примечания:
-#   - Для Apple Silicon можно использовать torch+mps (PyTorch>=2).
-#   - Модель Whisper можно сменить на "small", "medium", "large-v3" и т.д.
+"""
+� extract_text_embedding.py → Whisper + MiniLM
+    Whisper (base)
+    Вход: аудио 16 кГц
+    Выход: транскрипт (текст речи)
+        Whisper сам по себе даёт текст, не эмбеддинг.
+        
+    Текст подаётся в all-MiniLM-L6-v2.
+    MiniLM (sentence-transformers/all-MiniLM-L6-v2)
+        Вход: текст
+        Выход: эмбеддинг [384]
+    📘 E_text:
+        размерность 384,
+        семантический текстовый признак — смысл сказанного, лексика, контекст, значения слов.
+"""
 
 import os
 import numpy as np

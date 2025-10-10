@@ -6,14 +6,26 @@ import ffmpeg
 import tensorflow as tf
 import tensorflow_hub as hub
 
+"""
+🎧 extract_yamnet_bg.py → YAMNet
+    Модель: https://tfhub.dev/google/yamnet/1
+    Вход: моно-аудио 16 кГц
+    Выход:
+        embeddings: [N, 1024] — окно ~0.48 сек с шагом 0.48 сек,
+        scores: [N, 521] — вероятности классов аудио (Speech, Music, Noise, Animal и т.п.).
+        mean-пулинг по времени →
+    📘 E_aud_bg:
+        размерность 1024,
+        признаки фонового звука: шумы, музыка, окружение, но не содержание речи.
+"""
+
 VIDEO_PATH = "data/videos/sample.mp4"
 OUT_PATH = "data/embeddings/sample_yamnet_bg.npy"
 SAMPLE_RATE = 16000
 
 def load_audio_16k_mono(path: str, target_sr: int = 16000) -> np.ndarray:
     """
-    Сначала пытаемся через librosa+soundfile.
-    Если soundfile недоступен — декодируем через ffmpeg во временный WAV и снова читаем librosa.
+    Декодируем через ffmpeg во временный WAV и снова читаем librosa.
     """
     with tempfile.TemporaryDirectory() as td:
         wav_path = os.path.join(td, "audio_16k.wav")

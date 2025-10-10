@@ -14,12 +14,24 @@ from transformers import AutoProcessor, Wav2Vec2Model
 import tempfile
 import ffmpeg
 
+"""
+🗣 extract_wav2vec2_sp.py → Wav2Vec2
+    Модель: facebook/wav2vec2-base
+    Вход: моно-аудио 16 кГц
+    Выход:
+        last_hidden_state: [1, T', 768], где T' ≈ длина/20 (фреймы по ~20 мс).
+        mean-пулинг по времени →
+    📘 E_aud_sp:
+        размерность 768,
+            признаки речи (акустические): интонации, голос, фонетика, тембр, стиль речи, не смысл слов.
+"""
+
 VIDEO_PATH = "data/videos/sample.mp4"
 OUT_PATH = "data/embeddings/sample_wav2vec2_sp.npy"
 SAMPLE_RATE = 16000
 MODEL_ID = "facebook/wav2vec2-base"
-CHUNK_SEC = 20.0   # длина куска в секундах (20-30с обычно достаточно)
-OVERLAP_SEC = 0.0  # без перекрытия для простого усреднения
+CHUNK_SEC = 20.0
+OVERLAP_SEC = 0.0
 
 def get_device() -> torch.device:
     if torch.backends.mps.is_available():
