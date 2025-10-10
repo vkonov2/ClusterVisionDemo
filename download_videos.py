@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 from tqdm import tqdm
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 from pipeline_utils import as_posix, build_video_slug, find_video_file
 
@@ -199,6 +200,19 @@ def download_single_video(slug: str, sources: Iterable[str], output_dir: Path) -
                     "duration": video_info.get("duration"),
                     "filepath": as_posix(filename),
                 }
+        except DownloadError as exc:
+            message = str(exc)
+            if "sign in to confirm your age" in message.lower():
+                return {
+                    "status": "skipped",
+                    "reason": "age_restricted",
+                    "source": source,
+                    "title": None,
+                    "duration": None,
+                    "filepath": None,
+                }
+            last_error = message
+            continue
         except Exception as exc:  # yt-dlp raises различное
             last_error = str(exc)
             continue
