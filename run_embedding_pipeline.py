@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# Hugging Face токенизаторы должны знать, что мы запрещаем внутренний параллелизм
+# до того, как они будут импортированы. Это убирает повторяющиеся предупреждения
+# "The current process just got forked..." при работе SentenceTransformer.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import numpy as np
 import pandas as pd

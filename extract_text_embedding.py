@@ -24,6 +24,11 @@ import tempfile
 import ffmpeg
 import noisereduce as nr
 import whisper
+
+# Токенизаторы Hugging Face не должны пытаться использовать параллелизм после fork,
+# поэтому заранее запрещаем его, чтобы избежать предупреждений.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from sentence_transformers import SentenceTransformer
 
 VIDEO_PATH = "data/videos/sample.mp4"
