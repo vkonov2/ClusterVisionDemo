@@ -8,6 +8,14 @@ transformers>=4.41.0
 numpy
 opencv-python
 av
+pandas
+tqdm
+yt-dlp
+openpyxl
+scikit-learn
+umap-learn
+plotly>=5.20.0
+scenedetect>=0.6.4
 
 # --- Аудио + YAMNet ---
 tensorflow>=2.15.0
