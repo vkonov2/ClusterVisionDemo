@@ -7,8 +7,11 @@
 #  - нормализация и сохранение
 
 import os
-import numpy as np
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 import librosa
+import numpy as np
 import torch
 from transformers import AutoProcessor, Wav2Vec2Model
 import tempfile
@@ -58,52 +61,64 @@ def load_audio_16k_mono(path: str, target_sr: int = 16000) -> np.ndarray:
         y, sr = librosa.load(wav_path, sr=target_sr, mono=True)
         return y.astype(np.float32)
 
-def main():
-    dev = get_device()
-    print("Using device:", dev)
+@dataclass
+class Wav2Vec2Resources:
+    processor: AutoProcessor
+    model: Wav2Vec2Model
 
-    # 1) Аудио 16 кГц
-    print("🎧 Извлекаем аудио:", VIDEO_PATH)
-    y = load_audio_16k_mono(VIDEO_PATH, target_sr=SAMPLE_RATE)
+
+def extract_wav2vec2_embedding(
+    video_path: str,
+    sample_rate: int = SAMPLE_RATE,
+    chunk_sec: float = CHUNK_SEC,
+    overlap_sec: float = OVERLAP_SEC,
+    device: Optional[torch.device] = None,
+    resources: Optional[Wav2Vec2Resources] = None,
+) -> Tuple[np.ndarray, int]:
+    """Возвращает mean-пулинг эмбеддинга речи и длину аудио в сэмплах."""
+
+    dev = device or get_device()
+    y = load_audio_16k_mono(video_path, target_sr=sample_rate)
     n = len(y)
-    print("   Длина:", n, f"сэмплов (~{n/SAMPLE_RATE:.2f} сек)")
 
-    # 2) Модель
-    print("📥 Загружаем Wav2Vec2:", MODEL_ID)
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
-    model = Wav2Vec2Model.from_pretrained(MODEL_ID).to(dev)
-    model.eval()
+    if n == 0:
+        raise RuntimeError("Аудиодорожка пуста")
 
-    # 3) Чанкование и аккуратное усреднение по времени
-    chunk_size = int(CHUNK_SEC * SAMPLE_RATE)
-    hop = int(max(1, chunk_size - int(OVERLAP_SEC * SAMPLE_RATE)))
+    own_resources = resources is None
+    if resources is None:
+        processor = AutoProcessor.from_pretrained(MODEL_ID)
+        model = Wav2Vec2Model.from_pretrained(MODEL_ID).to(dev)
+        model.eval()
+        resources = Wav2Vec2Resources(processor=processor, model=model)
 
-    total_frames = 0  # суммарное число временных шагов после энкодера
+    processor = resources.processor
+    model = resources.model
+
+    chunk_size = int(chunk_sec * sample_rate)
+    hop = int(max(1, chunk_size - int(overlap_sec * sample_rate)))
+
+    total_frames = 0
     sum_hidden = None
 
     with torch.no_grad():
         start = 0
-        idx = 0
         while start < n:
             end = min(n, start + chunk_size)
             chunk = y[start:end]
 
-            inputs = processor(chunk, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-            input_values = inputs["input_values"].to(dev)  # [1, T]
+            inputs = processor(chunk, sampling_rate=sample_rate, return_tensors="pt")
+            input_values = inputs["input_values"].to(dev)
 
-            outputs = model(input_values=input_values)     # last_hidden_state: [1, T', D]
-            hidden = outputs.last_hidden_state             # torch.float32
-            Tprime = hidden.shape[1]                       # число временных шагов
-            # аккуратно суммируем по времени для глобального среднего
-            chunk_sum = hidden.sum(dim=1)                  # [1, D]
+            outputs = model(input_values=input_values)
+            hidden = outputs.last_hidden_state
+            Tprime = hidden.shape[1]
+
+            chunk_sum = hidden.sum(dim=1)
             if sum_hidden is None:
                 sum_hidden = chunk_sum.squeeze(0).cpu()
             else:
                 sum_hidden += chunk_sum.squeeze(0).cpu()
             total_frames += Tprime
-
-            idx += 1
-            print(f"   ✔️ chunk {idx}: samples [{start}:{end}) -> frames {Tprime}")
 
             if end == n:
                 break
@@ -112,12 +127,28 @@ def main():
     if total_frames == 0:
         raise RuntimeError("Wav2Vec2 вернул ноль временных кадров.")
 
-    # Глобальное среднее по времени
-    mean_hidden = (sum_hidden / float(total_frames))  # [D]
-    # L2-нормализация
+    mean_hidden = sum_hidden / float(total_frames)
     emb = torch.nn.functional.normalize(mean_hidden.unsqueeze(0), dim=-1).squeeze(0).numpy()
 
-    # 4) Сохранение
+    if own_resources:
+        del model
+        del processor
+
+    return emb.astype(np.float32), n
+
+
+def main():
+    dev = get_device()
+    print("Using device:", dev)
+
+    emb, _ = extract_wav2vec2_embedding(
+        VIDEO_PATH,
+        sample_rate=SAMPLE_RATE,
+        chunk_sec=CHUNK_SEC,
+        overlap_sec=OVERLAP_SEC,
+        device=dev,
+    )
+
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     np.save(OUT_PATH, emb.astype(np.float32))
     print("✅ E_aud_sp сохранён:", OUT_PATH, "shape:", emb.shape)
