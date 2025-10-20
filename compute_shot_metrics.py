@@ -94,7 +94,13 @@ def detect_shots(
         scene_manager.detect_scenes(video, show_progress=False)
         scene_list = scene_manager.get_scene_list()
     finally:
-        video.close()
+        close = getattr(video, "close", None)
+        if callable(close):
+            close()
+        else:
+            release = getattr(video, "release", None)
+            if callable(release):
+                release()
 
     if not scene_list:
         raise SceneDetectionError("No scenes were detected.")
