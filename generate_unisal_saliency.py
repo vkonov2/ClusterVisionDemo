@@ -191,7 +191,6 @@ def save_summary_outputs(
     output_dir: Path,
     frames: Sequence[np.ndarray],
     prob_maps: np.ndarray,
-    metadata: dict,
 ) -> None:
     summary_dir = output_dir / "summary"
     summary_dir.mkdir(parents=True, exist_ok=True)
@@ -204,12 +203,6 @@ def save_summary_outputs(
         overlay = cv2.addWeighted(first_frame, 0.55, heatmap, 0.45, 0)
         cv2.imwrite(str(summary_dir / f"{name}_heatmap.png"), heatmap)
         cv2.imwrite(str(summary_dir / f"{name}_overlay.png"), overlay)
-
-    (summary_dir / "metadata.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
 
 def compute_metadata(
     video_path: Path,
@@ -303,7 +296,7 @@ def main() -> int:
         args.sample_step,
         args.source,
     )
-    save_summary_outputs(output_dir, frames_info.frames_bgr, prob_maps, metadata)
+    save_summary_outputs(output_dir, frames_info.frames_bgr, prob_maps)
     print(json.dumps(metadata, ensure_ascii=False, indent=2))
     return 0
 

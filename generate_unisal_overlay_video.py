@@ -5,14 +5,14 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable, Iterator, List, Sequence
+from typing import Callable, Iterable, Iterator, List, Sequence, Tuple
 
 import cv2
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from generate_unisal_saliency import (
-    DEFAULT_VIDEO,
     ensure_unisal_repo,
     load_unisal_model,
     read_video_frames,
@@ -23,8 +23,9 @@ from generate_unisal_saliency import (
 )
 
 
-DEFAULT_OUTPUT_VIDEO = Path("outputs/unisal/000-youtube/overlay_with_audio.mp4")
-DEFAULT_INTERMEDIATE_VIDEO = Path("outputs/unisal/000-youtube/overlay_video_silent.mp4")
+DEFAULT_OUTPUT_ROOT = Path("outputs/unisal")
+DEFAULT_INPUT_DIR = Path("data/videos")
+DEFAULT_GLOB_PATTERN = "*.mp4"
 
 
 def chunk_sequence(sequence: Sequence[np.ndarray], chunk_size: int) -> Iterator[Sequence[np.ndarray]]:
@@ -50,6 +51,7 @@ def write_overlay_video(
     output_path: Path,
     fps: float,
     alpha: float,
+    progress: "tqdm" | None = None,
 ) -> None:
     """Write overlay frames to an mp4 container."""
 
@@ -75,6 +77,8 @@ def write_overlay_video(
             ) from exc
         overlay = overlay_frame(frame, prob_map, alpha)
         writer.write(overlay)
+        if progress is not None:
+            progress.update(1)
 
     try:
         extra = next(iterator)
@@ -85,6 +89,58 @@ def write_overlay_video(
 
     if extra is not None:
         raise RuntimeError("Model produced more saliency maps than frames processed")
+
+
+def process_video(
+    video_path: Path,
+    output_video: Path,
+    intermediate_video: Path,
+    *,
+    seconds: float | None,
+    chunk_size: int,
+    alpha: float,
+    device: torch.device,
+    model: "torch.nn.Module",
+    source: str,
+    keep_intermediate: bool,
+    get_optimal_out_size: Callable[[Tuple[int, int]], Tuple[int, int]],
+) -> Path:
+    frames_info = read_video_frames(video_path, seconds, frame_skip=1)
+    height, width = frames_info.frame_size
+    fps = frames_info.fps if frames_info.fps > 0 else 30.0
+
+    out_size = get_optimal_out_size((height, width))
+    transform = build_preprocess_transform(out_size)
+
+    prob_maps_generator = iter_prob_maps(
+        frames_info.frames_bgr,
+        max(1, chunk_size),
+        transform,
+        model,
+        device,
+        target_size=(height, width),
+        source=source,
+    )
+
+    intermediate_video.parent.mkdir(parents=True, exist_ok=True)
+    with tqdm(total=len(frames_info.frames_bgr), desc=video_path.name, unit="frame") as frame_bar:
+        write_overlay_video(
+            frames_info.frames_bgr,
+            prob_maps_generator,
+            intermediate_video,
+            fps,
+            alpha=alpha,
+            progress=frame_bar,
+        )
+
+    output_video.parent.mkdir(parents=True, exist_ok=True)
+    mux_audio(intermediate_video, video_path, output_video)
+
+    if not keep_intermediate and intermediate_video.exists():
+        intermediate_video.unlink()
+
+    tqdm.write(f"Overlay video with audio written to {output_video}")
+    return output_video
 
 
 def mux_audio(
@@ -153,13 +209,41 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Render UNISAL saliency overlays for every frame and mux with original audio",
     )
-    parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
-    parser.add_argument("--output-video", type=Path, default=DEFAULT_OUTPUT_VIDEO)
+    parser.add_argument(
+        "--video",
+        type=Path,
+        default=None,
+        help="Process only this video path (skips directory traversal)",
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=DEFAULT_INPUT_DIR,
+        help="Directory containing videos to process when --video is omitted",
+    )
+    parser.add_argument(
+        "--pattern",
+        type=str,
+        default=DEFAULT_GLOB_PATTERN,
+        help="Glob pattern for selecting videos inside --input-dir",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help="Root directory for generated overlay videos",
+    )
+    parser.add_argument(
+        "--output-video",
+        type=Path,
+        default=None,
+        help="Destination for the muxed overlay video (requires --video)",
+    )
     parser.add_argument(
         "--intermediate-video",
         type=Path,
-        default=DEFAULT_INTERMEDIATE_VIDEO,
-        help="Temporary silent overlay video path",
+        default=None,
+        help="Temporary silent overlay video path (requires --video)",
     )
     parser.add_argument("--seconds", type=float, default=None, help="Limit processing to the first N seconds")
     parser.add_argument(
@@ -188,45 +272,73 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.video is None and (args.output_video is not None or args.intermediate_video is not None):
+        parser.error("--output-video and --intermediate-video require --video to be set")
+
     repo_dir = ensure_unisal_repo()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = load_unisal_model(repo_dir, device)
 
-    frames_info = read_video_frames(args.video, args.seconds, frame_skip=1)
-    height, width = frames_info.frame_size
-    fps = frames_info.fps if frames_info.fps > 0 else 30.0
-
     sys.path.insert(0, str(repo_dir))
     from unisal.data import get_optimal_out_size  # type: ignore
 
-    out_size = get_optimal_out_size((height, width))
-    transform = build_preprocess_transform(out_size)
+    output_root = args.output_root.expanduser()
+    explicit_output = args.output_video.expanduser() if args.output_video else None
+    explicit_intermediate = args.intermediate_video.expanduser() if args.intermediate_video else None
 
-    prob_maps_generator = iter_prob_maps(
-        frames_info.frames_bgr,
-        max(1, args.chunk_size),
-        transform,
-        model,
-        device,
-        target_size=(height, width),
-        source=args.source,
-    )
+    videos_to_process: List[Path]
+    single_video_resolved: Path | None = None
+    if args.video is not None:
+        video_path = args.video.expanduser()
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        videos_to_process = [video_path]
+        single_video_resolved = video_path.resolve()
+    else:
+        input_dir = args.input_dir.expanduser()
+        if not input_dir.exists():
+            raise FileNotFoundError(f"Input directory not found: {input_dir}")
+        videos_to_process = sorted(
+            path for path in input_dir.glob(args.pattern) if path.is_file()
+        )
+        if not videos_to_process:
+            raise FileNotFoundError(
+                f"No videos matching pattern '{args.pattern}' found in {input_dir}"
+            )
 
-    write_overlay_video(
-        frames_info.frames_bgr,
-        prob_maps_generator,
-        args.intermediate_video,
-        fps,
-        alpha=args.alpha,
-    )
+    for video_path in tqdm(videos_to_process, desc="Videos", unit="video"):
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
 
-    args.output_video.parent.mkdir(parents=True, exist_ok=True)
-    mux_audio(args.intermediate_video, args.video, args.output_video)
+        resolved_video = video_path.resolve()
+        is_explicit_target = (
+            single_video_resolved is not None and resolved_video == single_video_resolved
+        )
 
-    if not args.keep_intermediate and args.intermediate_video.exists():
-        args.intermediate_video.unlink()
+        if is_explicit_target and explicit_output is not None:
+            output_video = explicit_output
+        else:
+            output_video = output_root / video_path.stem / "overlay_with_audio.mp4"
 
-    print(f"Overlay video with audio written to {args.output_video}")
+        if is_explicit_target and explicit_intermediate is not None:
+            intermediate_video = explicit_intermediate
+        else:
+            intermediate_video = output_video.with_name("overlay_video_silent.mp4")
+
+        process_video(
+            resolved_video,
+            output_video,
+            intermediate_video,
+            seconds=args.seconds,
+            chunk_size=args.chunk_size,
+            alpha=args.alpha,
+            device=device,
+            model=model,
+            source=args.source,
+            keep_intermediate=args.keep_intermediate,
+            get_optimal_out_size=get_optimal_out_size,
+        )
+
     return 0
 
 
