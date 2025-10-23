@@ -4,11 +4,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
+
+
+warnings.filterwarnings(
+    "ignore",
+    message="torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument.",
+    category=UserWarning,
+)
 
 import cv2
 import numpy as np
@@ -142,7 +151,15 @@ def run_unisal_inference(
     return predictions.cpu()
 
 
-def ensure_output_dir(path: Path) -> Path:
+def prepare_output_dir(path: Path) -> Path:
+    """Create a clean output directory for the current run."""
+
+    if path.exists():
+        for child in path.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -176,7 +193,8 @@ def save_summary_outputs(
     prob_maps: np.ndarray,
     metadata: dict,
 ) -> None:
-    summary_dir = ensure_output_dir(output_dir / "summary")
+    summary_dir = output_dir / "summary"
+    summary_dir.mkdir(parents=True, exist_ok=True)
     mean_map = prob_maps.mean(axis=0)
     max_map = prob_maps.max(axis=0)
 
@@ -264,7 +282,7 @@ def main() -> int:
 
     prob_maps = predictions.exp().squeeze(0).squeeze(1).numpy()
 
-    output_dir = ensure_output_dir(args.output)
+    output_dir = prepare_output_dir(args.output)
     saved = 0
     for idx, (frame, prob_map) in enumerate(zip(frames_info.frames_bgr, prob_maps)):
         if args.sample_step <= 0 or idx % args.sample_step == 0:
