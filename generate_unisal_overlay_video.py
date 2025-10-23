@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, List, Sequence, Tuple
 
@@ -26,6 +28,45 @@ from generate_unisal_saliency import (
 DEFAULT_OUTPUT_ROOT = Path("outputs/unisal")
 DEFAULT_INPUT_DIR = Path("data/videos")
 DEFAULT_GLOB_PATTERN = "*.mp4"
+
+
+@dataclass(frozen=True)
+class VideoJob:
+    video_path: Path
+    output_video: Path
+    intermediate_video: Path
+    seconds: float | None
+    chunk_size: int
+    alpha: float
+    source: str
+    keep_intermediate: bool
+
+
+_WORKER_MODEL: "torch.nn.Module" | None = None
+_WORKER_DEVICE: torch.device | None = None
+_WORKER_GET_OPTIMAL_OUT_SIZE: Callable[[Tuple[int, int]], Tuple[int, int]] | None = None
+
+
+def _worker_initializer(repo_dir_str: str, device_spec: str) -> None:
+    """Load the UNISAL model once per worker process."""
+
+    repo_dir = ensure_unisal_repo(Path(repo_dir_str))
+    sys.path.insert(0, str(repo_dir))
+    from unisal.data import get_optimal_out_size  # type: ignore
+
+    device = torch.device(device_spec)
+    model = load_unisal_model(repo_dir, device)
+
+    global _WORKER_MODEL, _WORKER_DEVICE, _WORKER_GET_OPTIMAL_OUT_SIZE
+    _WORKER_MODEL = model
+    _WORKER_DEVICE = device
+    _WORKER_GET_OPTIMAL_OUT_SIZE = get_optimal_out_size
+
+
+def _ensure_worker_ready() -> tuple["torch.nn.Module", torch.device, Callable[[Tuple[int, int]], Tuple[int, int]]]:
+    if _WORKER_MODEL is None or _WORKER_DEVICE is None or _WORKER_GET_OPTIMAL_OUT_SIZE is None:
+        raise RuntimeError("Worker model has not been initialised")
+    return _WORKER_MODEL, _WORKER_DEVICE, _WORKER_GET_OPTIMAL_OUT_SIZE
 
 
 def chunk_sequence(sequence: Sequence[np.ndarray], chunk_size: int) -> Iterator[Sequence[np.ndarray]]:
@@ -205,6 +246,23 @@ def iter_prob_maps(
             yield prob_map
 
 
+def process_video_job(job: VideoJob) -> Path:
+    model, device, get_optimal_out_size = _ensure_worker_ready()
+    return process_video(
+        job.video_path,
+        job.output_video,
+        job.intermediate_video,
+        seconds=job.seconds,
+        chunk_size=job.chunk_size,
+        alpha=job.alpha,
+        device=device,
+        model=model,
+        source=job.source,
+        keep_intermediate=job.keep_intermediate,
+        get_optimal_out_size=get_optimal_out_size,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Render UNISAL saliency overlays for every frame and mux with original audio",
@@ -270,14 +328,25 @@ def main() -> int:
         action="store_true",
         help="Keep the silent overlay video instead of deleting it",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes to use (CPU only)",
+    )
     args = parser.parse_args()
 
     if args.video is None and (args.output_video is not None or args.intermediate_video is not None):
         parser.error("--output-video and --intermediate-video require --video to be set")
 
     repo_dir = ensure_unisal_repo()
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = load_unisal_model(repo_dir, device)
+    device_spec = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device_spec)
+
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.workers > 1 and device.type == "cuda":
+        parser.error("--workers > 1 is not supported when using CUDA devices")
 
     sys.path.insert(0, str(repo_dir))
     from unisal.data import get_optimal_out_size  # type: ignore
@@ -306,7 +375,8 @@ def main() -> int:
                 f"No videos matching pattern '{args.pattern}' found in {input_dir}"
             )
 
-    for video_path in tqdm(videos_to_process, desc="Videos", unit="video"):
+    jobs: List[VideoJob] = []
+    for video_path in videos_to_process:
         if not video_path.exists():
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
@@ -325,19 +395,55 @@ def main() -> int:
         else:
             intermediate_video = output_video.with_name("overlay_video_silent.mp4")
 
-        process_video(
-            resolved_video,
-            output_video,
-            intermediate_video,
-            seconds=args.seconds,
-            chunk_size=args.chunk_size,
-            alpha=args.alpha,
-            device=device,
-            model=model,
-            source=args.source,
-            keep_intermediate=args.keep_intermediate,
-            get_optimal_out_size=get_optimal_out_size,
+        jobs.append(
+            VideoJob(
+                video_path=resolved_video,
+                output_video=output_video,
+                intermediate_video=intermediate_video,
+                seconds=args.seconds,
+                chunk_size=args.chunk_size,
+                alpha=args.alpha,
+                source=args.source,
+                keep_intermediate=args.keep_intermediate,
+            )
         )
+
+    if args.workers == 1:
+        model = load_unisal_model(repo_dir, device)
+        with tqdm(jobs, desc="Videos", unit="video") as video_bar:
+            for job in video_bar:
+                process_video(
+                    job.video_path,
+                    job.output_video,
+                    job.intermediate_video,
+                    seconds=job.seconds,
+                    chunk_size=job.chunk_size,
+                    alpha=job.alpha,
+                    device=device,
+                    model=model,
+                    source=job.source,
+                    keep_intermediate=job.keep_intermediate,
+                    get_optimal_out_size=get_optimal_out_size,
+                )
+    else:
+        with ProcessPoolExecutor(
+            max_workers=args.workers,
+            initializer=_worker_initializer,
+            initargs=(str(repo_dir), device_spec),
+        ) as executor:
+            futures = {executor.submit(process_video_job, job): job for job in jobs}
+            try:
+                for future in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc="Videos",
+                    unit="video",
+                ):
+                    future.result()
+            except Exception:
+                for pending in futures:
+                    pending.cancel()
+                raise
 
     return 0
 
