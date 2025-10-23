@@ -202,6 +202,7 @@ def compute_metadata(
     fps: float,
     seconds: float | None,
     frame_skip: int,
+    sample_step: int,
     source: str,
 ) -> dict:
     hook_strength = float(np.mean(prob_maps.max(axis=(1, 2))))
@@ -211,6 +212,7 @@ def compute_metadata(
         "fps": fps,
         "seconds_limit": seconds,
         "frame_skip": frame_skip,
+        "sample_step": sample_step,
         "model_repo": REPO_URL,
         "model_cache": str(repo_dir),
         "device": str(device),
@@ -227,7 +229,12 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--seconds", type=float, default=5.0, help="Duration of the clip to analyse")
     parser.add_argument("--frame-skip", type=int, default=1, help="Sample every N-th frame from the source video")
-    parser.add_argument("--sample-step", type=int, default=12, help="Store overlays for every N-th processed frame")
+    parser.add_argument(
+        "--sample-step",
+        type=int,
+        default=3,
+        help="Store overlays for every N-th processed frame",
+    )
     parser.add_argument("--max-saved-frames", type=int, default=6, help="Maximum number of per-frame overlays to save")
     parser.add_argument("--source", type=str, default="DHF1K", help="UNISAL domain to use for BatchNorm statistics")
     parser.add_argument("--device", type=str, default=None, help="Force computation device (cpu or cuda)")
@@ -275,6 +282,7 @@ def main() -> int:
         frames_info.fps,
         args.seconds,
         args.frame_skip,
+        args.sample_step,
         args.source,
     )
     save_summary_outputs(output_dir, frames_info.frames_bgr, prob_maps, metadata)

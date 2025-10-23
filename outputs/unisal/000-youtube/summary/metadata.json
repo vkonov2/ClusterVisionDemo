@@ -4,6 +4,7 @@
   "fps": 24.0,
   "seconds_limit": 5.0,
   "frame_skip": 1,
+  "sample_step": 3,
   "model_repo": "https://github.com/rdroste/unisal.git",
   "model_cache": "/workspace/ClusterVisionDemo/.cache/unisal/repo",
   "device": "cpu",
