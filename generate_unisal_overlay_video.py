@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, List, Sequence, Tuple
 
@@ -28,6 +30,7 @@ from generate_unisal_saliency import (
 DEFAULT_OUTPUT_ROOT = Path("outputs/unisal")
 DEFAULT_INPUT_DIR = Path("data/videos")
 DEFAULT_GLOB_PATTERN = "*.mp4"
+DEFAULT_WORKER_COUNT = max(1, (os.cpu_count() or 1) - 2)
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,7 @@ class VideoJob:
     alpha: float
     source: str
     keep_intermediate: bool
+    progress_position: int = 0
 
 
 _WORKER_MODEL: "torch.nn.Module" | None = None
@@ -145,6 +149,7 @@ def process_video(
     source: str,
     keep_intermediate: bool,
     get_optimal_out_size: Callable[[Tuple[int, int]], Tuple[int, int]],
+    progress_position: int = 0,
 ) -> Path:
     frames_info = read_video_frames(video_path, seconds, frame_skip=1)
     height, width = frames_info.frame_size
@@ -164,7 +169,14 @@ def process_video(
     )
 
     intermediate_video.parent.mkdir(parents=True, exist_ok=True)
-    with tqdm(total=len(frames_info.frames_bgr), desc=video_path.name, unit="frame") as frame_bar:
+    with tqdm(
+        total=len(frames_info.frames_bgr),
+        desc=video_path.name,
+        unit="frame",
+        position=progress_position,
+        leave=True,
+        dynamic_ncols=True,
+    ) as frame_bar:
         write_overlay_video(
             frames_info.frames_bgr,
             prob_maps_generator,
@@ -180,7 +192,7 @@ def process_video(
     if not keep_intermediate and intermediate_video.exists():
         intermediate_video.unlink()
 
-    tqdm.write(f"Overlay video with audio written to {output_video}")
+    frame_bar.write(f"Overlay video with audio written to {output_video}")
     return output_video
 
 
@@ -260,6 +272,7 @@ def process_video_job(job: VideoJob) -> Path:
         source=job.source,
         keep_intermediate=job.keep_intermediate,
         get_optimal_out_size=get_optimal_out_size,
+        progress_position=job.progress_position,
     )
 
 
@@ -331,7 +344,7 @@ def main() -> int:
     parser.add_argument(
         "--workers",
         type=int,
-        default=1,
+        default=DEFAULT_WORKER_COUNT,
         help="Number of parallel worker processes to use (CPU only)",
     )
     args = parser.parse_args()
@@ -410,7 +423,7 @@ def main() -> int:
 
     if args.workers == 1:
         model = load_unisal_model(repo_dir, device)
-        with tqdm(jobs, desc="Videos", unit="video") as video_bar:
+        with tqdm(jobs, desc="Videos", unit="video", position=0) as video_bar:
             for job in video_bar:
                 process_video(
                     job.video_path,
@@ -424,6 +437,7 @@ def main() -> int:
                     source=job.source,
                     keep_intermediate=job.keep_intermediate,
                     get_optimal_out_size=get_optimal_out_size,
+                    progress_position=1,
                 )
     else:
         with ProcessPoolExecutor(
@@ -431,19 +445,44 @@ def main() -> int:
             initializer=_worker_initializer,
             initargs=(str(repo_dir), device_spec),
         ) as executor:
-            futures = {executor.submit(process_video_job, job): job for job in jobs}
+            pending: set = set()
+            future_to_position: dict = {}
+            available_positions = deque(range(args.workers))
+            jobs_iter = iter(jobs)
+
+            def submit_job(job: VideoJob, position: int) -> None:
+                job_with_position = replace(job, progress_position=position)
+                future = executor.submit(process_video_job, job_with_position)
+                pending.add(future)
+                future_to_position[future] = position
+
             try:
-                for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc="Videos",
-                    unit="video",
-                ):
-                    future.result()
-            except Exception:
-                for pending in futures:
-                    pending.cancel()
-                raise
+                while available_positions:
+                    job = next(jobs_iter)
+                    submit_job(job, available_positions.popleft())
+            except StopIteration:
+                pass
+
+            while pending:
+                done, not_done = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    position = future_to_position.pop(future)
+                    try:
+                        future.result()
+                    except Exception:
+                        for remaining in pending:
+                            if remaining is not future:
+                                remaining.cancel()
+                        raise
+                    available_positions.append(position)
+
+                pending = not_done
+                try:
+                    while available_positions:
+                        job = next(jobs_iter)
+                        submit_job(job, available_positions.popleft())
+                except StopIteration:
+                    continue
 
     return 0
 
