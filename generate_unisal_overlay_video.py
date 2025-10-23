@@ -30,7 +30,7 @@ from generate_unisal_saliency import (
 DEFAULT_OUTPUT_ROOT = Path("outputs/unisal")
 DEFAULT_INPUT_DIR = Path("data/videos")
 DEFAULT_GLOB_PATTERN = "*.mp4"
-DEFAULT_WORKER_COUNT = max(1, (os.cpu_count() or 1) - 2)
+DEFAULT_WORKER_COUNT = 1
 
 
 @dataclass(frozen=True)
