@@ -62,7 +62,7 @@ def _load_metrics(metrics_path: Path, status_column: str) -> pd.DataFrame:
     return frame
 
 
-def _load_dataset(dataset_path: Path, index_column: str, pretopic_column: str) -> pd.DataFrame:
+def _load_dataset(dataset_path: Path, index_column: str, topic_column: str) -> pd.DataFrame:
     if not dataset_path.exists():
         raise FileNotFoundError(f"Не найден датасет: {dataset_path}")
 
@@ -74,12 +74,12 @@ def _load_dataset(dataset_path: Path, index_column: str, pretopic_column: str) -
     dataset = dataset.dropna(subset=[index_column])
     dataset[index_column] = dataset[index_column].astype(int)
 
-    if pretopic_column not in dataset.columns:
+    if topic_column not in dataset.columns:
         raise ValueError(
-            f"В датасете отсутствует столбец '{pretopic_column}' с претопиками"
+            f"В датасете отсутствует столбец '{topic_column}' с топиками"
         )
 
-    return dataset[[index_column, pretopic_column]].copy()
+    return dataset[[index_column, topic_column]].copy()
 
 
 def _build_hist_grid(
@@ -141,9 +141,9 @@ def _build_hist_grid(
     return fig
 
 
-def _make_summary_table(frame: pd.DataFrame, pretopic_column: str) -> str:
+def _make_summary_table(frame: pd.DataFrame, topic_column: str) -> str:
     counts = (
-        frame.groupby(pretopic_column)
+        frame.groupby(topic_column)
         .size()
         .reset_index(name="videos")
         .sort_values("videos", ascending=False)
@@ -151,10 +151,10 @@ def _make_summary_table(frame: pd.DataFrame, pretopic_column: str) -> str:
     counts["videos"] = counts["videos"].astype(int)
 
     total = counts["videos"].sum()
-    counts.loc[len(counts)] = {pretopic_column: "Всего", "videos": int(total)}
+    counts.loc[len(counts)] = {topic_column: "Всего", "videos": int(total)}
 
     html_table = counts.rename(
-        columns={pretopic_column: "Претопик", "videos": "Количество видео"}
+        columns={topic_column: "Топик", "videos": "Количество видео"}
     ).to_html(classes="data-table", index=False, border=0)
 
     return html_table
@@ -166,25 +166,25 @@ def build_report(
     output_path: Path,
     *,
     index_column: str = "index",
-    pretopic_column: str = "pretopic",
+    topic_column: str = "topic",
     status_column: str = "status",
     nbins: int = 30,
 ) -> Path:
     metrics_frame = _load_metrics(metrics_path, status_column=status_column)
-    dataset_frame = _load_dataset(dataset_path, index_column=index_column, pretopic_column=pretopic_column)
+    dataset_frame = _load_dataset(dataset_path, index_column=index_column, topic_column=topic_column)
 
     merged = metrics_frame.merge(dataset_frame, on=index_column, how="left")
-    merged[pretopic_column] = merged[pretopic_column].fillna("Не указано")
+    merged[topic_column] = merged[topic_column].fillna("Не указано")
 
     overall_fig = _build_hist_grid(merged, METRIC_COLUMNS, "Распределения по всем видео", nbins=nbins)
 
-    pretopic_sections: list[tuple[str, str]] = []
-    for value, subset in merged.groupby(pretopic_column):
-        fig = _build_hist_grid(subset, METRIC_COLUMNS, f"Претопик: {value}", nbins=nbins)
-        pretopic_sections.append((value, to_html(fig, include_plotlyjs=False, full_html=False)))
+    topic_sections: list[tuple[str, str]] = []
+    for value, subset in merged.groupby(topic_column):
+        fig = _build_hist_grid(subset, METRIC_COLUMNS, f"Топик: {value}", nbins=nbins)
+        topic_sections.append((value, to_html(fig, include_plotlyjs=False, full_html=False)))
 
     overall_html = to_html(overall_fig, include_plotlyjs="cdn", full_html=False)
-    summary_table = _make_summary_table(merged, pretopic_column)
+    summary_table = _make_summary_table(merged, topic_column)
 
     sections = [
         "<!DOCTYPE html>",
@@ -221,10 +221,10 @@ def build_report(
         "    </section>",
     ]
 
-    if pretopic_sections:
+    if topic_sections:
         sections.append("    <section>")
-        sections.append("      <h2>По претопикам</h2>")
-        for value, html in pretopic_sections:
+        sections.append("      <h2>По топикам</h2>")
+        for value, html in topic_sections:
             sections.append("      <details open>")
             sections.append(f"        <summary>{value}</summary>")
             sections.append("        <div style=\"margin-top:16px;\">")
@@ -273,8 +273,8 @@ def parse_args() -> argparse.Namespace:
         help="Название столбца с индексом видео",
     )
     parser.add_argument(
-        "--pretopic-column",
-        default="pretopic",
+        "--topic-column",
+        default="topic",
         help="Название столбца с претопиком",
     )
     parser.add_argument(
@@ -298,7 +298,7 @@ def main() -> int:
         dataset_path=args.dataset,
         output_path=args.output,
         index_column=args.index_column,
-        pretopic_column=args.pretopic_column,
+        topic_column=args.topic_column,
         status_column=args.status_column,
         nbins=args.nbins,
     )
