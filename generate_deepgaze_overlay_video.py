@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
-import sys
-from collections import deque
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, List, Sequence
 
@@ -31,9 +28,6 @@ from generate_unisal_saliency import read_video_frames, render_heatmap
 DEFAULT_OUTPUT_ROOT = Path("outputs/deepgaze")
 DEFAULT_INPUT_DIR = Path("data/videos")
 DEFAULT_GLOB_PATTERN = "*.mp4"
-DEFAULT_WORKER_COUNT = 1
-
-
 @dataclass(frozen=True)
 class VideoJob:
     video_path: Path
@@ -43,53 +37,15 @@ class VideoJob:
     chunk_size: int
     alpha: float
     keep_intermediate: bool
-    progress_position: int = 0
 
 
-_WORKER_MODEL: torch.nn.Module | None = None
-_WORKER_DEVICE: torch.device | None = None
-_WORKER_MODEL_NAME: str | None = None
-_WORKER_UNIFORM_CENTERBIAS: bool = False
-_WORKER_CENTERBIAS_TEMPLATE: np.ndarray | None = None
-
-
-def _worker_initializer(
-    repo_dir_str: str,
-    device_spec: str,
-    model_name: str,
-    centerbias_path_str: str,
-    uniform_centerbias: bool,
-) -> None:
-    repo_dir = ensure_deepgaze_repo(Path(repo_dir_str))
-    sys.path.insert(0, str(repo_dir))
-
-    device = torch.device(device_spec)
-    model = load_deepgaze_model(repo_dir, model_name, device)
-
-    template: np.ndarray | None = None
-    if not uniform_centerbias:
-        template_path = Path(centerbias_path_str) if centerbias_path_str else ensure_centerbias()
-        template = np.load(template_path)
-
-    global _WORKER_MODEL, _WORKER_DEVICE, _WORKER_MODEL_NAME
-    global _WORKER_UNIFORM_CENTERBIAS, _WORKER_CENTERBIAS_TEMPLATE
-    _WORKER_MODEL = model
-    _WORKER_DEVICE = device
-    _WORKER_MODEL_NAME = model_name
-    _WORKER_UNIFORM_CENTERBIAS = uniform_centerbias
-    _WORKER_CENTERBIAS_TEMPLATE = template
-
-
-def _ensure_worker_ready() -> tuple[torch.nn.Module, torch.device, str, bool, np.ndarray | None]:
-    if _WORKER_MODEL is None or _WORKER_DEVICE is None or _WORKER_MODEL_NAME is None:
-        raise RuntimeError("DeepGaze модель ещё не загружена в воркере")
-    return (
-        _WORKER_MODEL,
-        _WORKER_DEVICE,
-        _WORKER_MODEL_NAME,
-        _WORKER_UNIFORM_CENTERBIAS,
-        _WORKER_CENTERBIAS_TEMPLATE,
-    )
+@dataclass(frozen=True)
+class ModelContext:
+    model: torch.nn.Module
+    device: torch.device
+    model_name: str
+    uniform_centerbias: bool
+    centerbias_template: np.ndarray | None
 
 
 def overlay_frame(frame_bgr: np.ndarray, prob_map: np.ndarray, alpha: float) -> np.ndarray:
@@ -199,10 +155,9 @@ def process_video(
     chunk_size: int,
     alpha: float,
     keep_intermediate: bool,
+    context: ModelContext,
     progress_position: int = 0,
 ) -> Path:
-    model, device, model_name, uniform_centerbias, centerbias_template = _ensure_worker_ready()
-
     frames_info = read_video_frames(video_path, seconds, frame_skip=1)
     height, width = frames_info.frame_size
     fps = frames_info.fps if frames_info.fps > 0 else 30.0
@@ -210,12 +165,12 @@ def process_video(
     centerbias_log = build_centerbias(
         height,
         width,
-        uniform=uniform_centerbias,
-        template=centerbias_template,
+        uniform=context.uniform_centerbias,
+        template=context.centerbias_template,
     )
-    centerbias_tensor = torch.from_numpy(centerbias_log).float().to(device)
+    centerbias_tensor = torch.from_numpy(centerbias_log).float().to(context.device)
 
-    if model_name.lower().endswith("3"):
+    if context.model_name.lower().endswith("3"):
         chunk_size = 1
 
     with tqdm(
@@ -228,9 +183,9 @@ def process_video(
     ) as frame_bar:
         prob_maps = iterate_prob_maps(
             frames_info.frames_bgr,
-            model,
-            device,
-            model_name,
+            context.model,
+            context.device,
+            context.model_name,
             centerbias_tensor,
             centerbias_log,
             max(1, chunk_size),
@@ -288,19 +243,6 @@ def mux_audio(
         )
 
 
-def process_video_job(job: VideoJob) -> Path:
-    return process_video(
-        job.video_path,
-        job.output_video,
-        job.intermediate_video,
-        seconds=job.seconds,
-        chunk_size=job.chunk_size,
-        alpha=job.alpha,
-        keep_intermediate=job.keep_intermediate,
-        progress_position=job.progress_position,
-    )
-
-
 def prepare_jobs(
     videos: Sequence[Path],
     output_root: Path,
@@ -331,7 +273,6 @@ def prepare_jobs(
                 chunk_size=chunk_size,
                 alpha=alpha,
                 keep_intermediate=keep_intermediate,
-                progress_position=index,
             )
         )
     return jobs
@@ -340,69 +281,6 @@ def prepare_jobs(
 def gather_videos(input_dir: Path, pattern: str) -> list[Path]:
     videos = sorted(input_dir.glob(pattern))
     return [path for path in videos if path.is_file()]
-
-
-def schedule_jobs(
-    jobs: Sequence[VideoJob],
-    *,
-    workers: int,
-    initializer,
-    init_args: tuple,
-) -> list[Path]:
-    if workers <= 1:
-        results: list[Path] = []
-        for job in jobs:
-            results.append(process_video_job(replace(job, progress_position=0)))
-        return results
-
-    completed: list[Path] = []
-    with ProcessPoolExecutor(
-        max_workers=workers,
-        initializer=initializer,
-        initargs=init_args,
-    ) as executor:
-        pending: set = set()
-        future_to_position: dict = {}
-        available_positions = deque(range(workers))
-        jobs_iter = iter(jobs)
-
-        def submit_job(job: VideoJob, position: int) -> None:
-            job_with_position = replace(job, progress_position=position)
-            future = executor.submit(process_video_job, job_with_position)
-            pending.add(future)
-            future_to_position[future] = position
-
-        try:
-            while available_positions:
-                job = next(jobs_iter)
-                submit_job(job, available_positions.popleft())
-        except StopIteration:
-            pass
-
-        while pending:
-            done, not_done = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                position = future_to_position.pop(future)
-                try:
-                    result_path = future.result()
-                except Exception:
-                    for remaining in pending:
-                        if remaining is not future:
-                            remaining.cancel()
-                    raise
-                completed.append(result_path)
-                available_positions.append(position)
-                pending.remove(future)
-
-            pending = not_done
-            try:
-                while available_positions:
-                    job = next(jobs_iter)
-                    submit_job(job, available_positions.popleft())
-            except StopIteration:
-                continue
-
-    return completed
 
 
 def main() -> int:
@@ -433,7 +311,6 @@ def main() -> int:
     parser.add_argument("--model", choices=["deepgaze2e", "deepgaze3"], default="deepgaze2e")
     parser.add_argument("--centerbias", type=Path, default=None, help="Файл лог-плотности центр-биаса")
     parser.add_argument("--uniform-centerbias", action="store_true", help="Использовать равномерный центр-биас")
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKER_COUNT, help="Количество параллельных воркеров")
     parser.add_argument("--overwrite", action="store_true", help="Перезаписать существующие результаты")
     args = parser.parse_args()
 
@@ -483,29 +360,40 @@ def main() -> int:
 
     repo_dir = ensure_deepgaze_repo()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model = load_deepgaze_model(repo_dir, args.model, device)
 
     if args.uniform_centerbias:
         centerbias_path = None
     else:
         centerbias_path = args.centerbias or ensure_centerbias()
 
-    init_args = (
-        str(repo_dir),
-        str(device),
-        args.model,
-        str(centerbias_path) if centerbias_path else "",
-        args.uniform_centerbias,
+    if centerbias_path:
+        centerbias_template = np.load(centerbias_path)
+    else:
+        centerbias_template = None
+
+    context = ModelContext(
+        model=model,
+        device=device,
+        model_name=args.model,
+        uniform_centerbias=args.uniform_centerbias,
+        centerbias_template=centerbias_template,
     )
 
-    results = schedule_jobs(
-        [replace(job, chunk_size=max(1, args.chunk_size)) for job in jobs],
-        workers=max(1, args.workers),
-        initializer=_worker_initializer,
-        init_args=init_args,
-    )
-
-    for path in results:
-        print(f"Готово: {path}")
+    results: list[Path] = []
+    for job in jobs:
+        result_path = process_video(
+            job.video_path,
+            job.output_video,
+            job.intermediate_video,
+            seconds=job.seconds,
+            chunk_size=max(1, job.chunk_size),
+            alpha=job.alpha,
+            keep_intermediate=job.keep_intermediate,
+            context=context,
+        )
+        results.append(result_path)
+        print(f"Готово: {result_path}")
 
     return 0
 
