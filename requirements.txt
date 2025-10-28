@@ -10,6 +10,7 @@ opencv-python
 av
 pandas
 tqdm
+boltons
 yt-dlp
 openpyxl
 scikit-learn
