@@ -6,7 +6,7 @@ import base64
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -201,33 +201,58 @@ def compute_pair_samples(frames: Sequence[FrameSample]) -> List[PairSample]:
     return pairs
 
 
+def normalize_series(values: Sequence[float]) -> Tuple[List[float], float, float, float]:
+    arr = [float(v) for v in values]
+    if not arr:
+        return [], 0.0, 0.0, 0.0
+
+    min_value = min(arr)
+    max_value = max(arr)
+    span = max_value - min_value
+
+    if span <= 1e-12:
+        normalized = [0.0 for _ in arr]
+        avg_normalized = 0.0
+    else:
+        normalized = [(value - min_value) / span for value in arr]
+        avg_normalized = (float(np.mean(arr)) - min_value) / span
+
+    return normalized, avg_normalized, min_value, max_value
+
+
 def build_single_frame_figure(
     *,
     title: str,
     x: Sequence[int],
-    y: Sequence[float],
-    avg_value: float,
+    values: Sequence[float],
     value_label: str,
-    customdata: Sequence[int],
+    indices: Sequence[int],
     color: str,
 ) -> go.Figure:
     fig = go.Figure()
+    normalized, avg_normalized, min_value, max_value = normalize_series(values)
+    avg_actual = float(np.mean(values)) if values else 0.0
+    customdata = [[index, actual] for index, actual in zip(indices, values)]
     fig.add_trace(
         go.Scatter(
             x=x,
-            y=y,
+            y=normalized,
             mode="lines+markers",
             marker=dict(size=8, color=color),
             line=dict(color=color),
             customdata=customdata,
-            hovertemplate="Кадр %{x}<br>" + value_label + ": %{y:.4f}<extra></extra>",
+            hovertemplate=(
+                "Кадр %{x}<br>"
+                + value_label
+                + ": %{customdata[1]:.4f}<br>Норм.: %{y:.4f}<extra></extra>"
+            ),
         ),
     )
     fig.add_hline(
-        y=avg_value,
+        y=avg_normalized,
         line_dash="dash",
         line_color="#666",
-        annotation_text=f"Среднее: {avg_value:.4f}",
+        annotation_text=f"Среднее: {avg_actual:.4f}",
         annotation_position="top right",
         annotation_font=dict(color="#333"),
     )
@@ -235,7 +260,7 @@ def build_single_frame_figure(
         title=title,
         template="plotly_white",
         xaxis_title="Номер кадра",
-        yaxis_title=value_label,
+        yaxis_title=f"Норм. значение (мин {min_value:.4f} · макс {max_value:.4f})",
         hovermode="x",
     )
     fig.update_yaxes(range=[0, 1], constrain="domain")
@@ -246,33 +271,43 @@ def build_pair_figure(
     *,
     title: str,
     x_labels: Sequence[str],
-    y_values: Sequence[float],
-    avg_value: float,
+    values: Sequence[float],
     value_label: str,
     customdata: Sequence[Sequence[object]],
     color: str,
     hovertemplate: str | None = None,
 ) -> go.Figure:
     fig = go.Figure()
+    normalized, avg_normalized, min_value, max_value = normalize_series(values)
+    avg_actual = float(np.mean(values)) if values else 0.0
+    customdata_with_actual: List[List[object]] = [
+        list(data) + [actual]
+        for data, actual in zip(customdata, values)
+    ]
+    actual_index = len(customdata[0]) if customdata else 0
     fig.add_trace(
         go.Scatter(
             x=x_labels,
-            y=y_values,
+            y=normalized,
             mode="lines+markers",
             marker=dict(size=8, color=color),
             line=dict(color=color),
-            customdata=customdata,
+            customdata=customdata_with_actual,
             hovertemplate=(
                 hovertemplate
-                or ("Кадры %{x}<br>" + value_label + ": %{y:.4f}<extra></extra>")
+                or (
+                    "Кадры %{x}<br>"
+                    + value_label
+                    + f": %{{customdata[{actual_index}]:.4f}}<br>Норм.: %{{y:.4f}}<extra></extra>"
+                )
             ),
         ),
     )
     fig.add_hline(
-        y=avg_value,
+        y=avg_normalized,
         line_dash="dash",
         line_color="#666",
-        annotation_text=f"Среднее: {avg_value:.4f}",
+        annotation_text=f"Среднее: {avg_actual:.4f}",
         annotation_position="top right",
         annotation_font=dict(color="#333"),
     )
@@ -280,7 +315,7 @@ def build_pair_figure(
         title=title,
         template="plotly_white",
         xaxis_title="Пара кадров",
-        yaxis_title=value_label,
+        yaxis_title=f"Норм. значение (мин {min_value:.4f} · макс {max_value:.4f})",
         hovermode="x",
         xaxis_tickangle=-90,
     )
@@ -739,7 +774,8 @@ def render_report_html(
                 const el = document.getElementById(config.figureId);
                 if (!el) return;
                 el.on('plotly_hover', (event) => {{
-                    const frameIndex = event.points?.[0]?.customdata;
+                    const payload = event.points?.[0]?.customdata;
+                    const frameIndex = Array.isArray(payload) ? payload[0] : payload;
                     if (frameIndex === undefined || frameIndex === null) return;
                     updateSingleMetricPreview(config, frameIndex);
                 }});
@@ -777,48 +813,44 @@ def compute_figures(frame_samples: Sequence[FrameSample], pair_samples: Sequence
         raise ValueError("Нет данных для построения метрик")
 
     frame_numbers = [sample.index + 1 for sample in frame_samples]
-    customdata = [sample.index for sample in frame_samples]
+    frame_indices = [sample.index for sample in frame_samples]
 
-    mean_values = [float(np.clip(sample.prob_map.mean(), 0.0, 1.0)) for sample in frame_samples]
-    peak_values = [float(np.clip(sample.prob_map.max(), 0.0, 1.0)) for sample in frame_samples]
-    conc10_values = [float(np.clip(compute_concentration(sample.prob_map, 0.10), 0.0, 1.0)) for sample in frame_samples]
-    conc20_values = [float(np.clip(compute_concentration(sample.prob_map, 0.20), 0.0, 1.0)) for sample in frame_samples]
+    mean_values = [float(sample.prob_map.mean()) for sample in frame_samples]
+    peak_values = [float(sample.prob_map.max()) for sample in frame_samples]
+    conc10_values = [float(compute_concentration(sample.prob_map, 0.10)) for sample in frame_samples]
+    conc20_values = [float(compute_concentration(sample.prob_map, 0.20)) for sample in frame_samples]
 
     figures: Dict[str, go.Figure] = {}
     figures['mean'] = build_single_frame_figure(
         title="Mean — средняя вероятность по кадру",
         x=frame_numbers,
-        y=mean_values,
-        avg_value=float(np.mean(mean_values)),
-        value_label="Норм. среднее",
-        customdata=customdata,
+        values=mean_values,
+        value_label="Средняя вероятность",
+        indices=frame_indices,
         color="#2565d0",
     )
     figures['peak'] = build_single_frame_figure(
         title="Peak — максимум вероятности",
         x=frame_numbers,
-        y=peak_values,
-        avg_value=float(np.mean(peak_values)),
-        value_label="Норм. максимум",
-        customdata=customdata,
+        values=peak_values,
+        value_label="Максимальная вероятность",
+        indices=frame_indices,
         color="#e4572e",
     )
     figures['conc10'] = build_single_frame_figure(
         title="Concentration 10% — доля вероятности в топ-10% пикселей",
         x=frame_numbers,
-        y=conc10_values,
-        avg_value=float(np.mean(conc10_values)),
-        value_label="Норм. концентрация 10%",
-        customdata=customdata,
+        values=conc10_values,
+        value_label="Концентрация 10%",
+        indices=frame_indices,
         color="#3aa17e",
     )
     figures['conc20'] = build_single_frame_figure(
         title="Concentration 20% — доля вероятности в топ-20% пикселей",
         x=frame_numbers,
-        y=conc20_values,
-        avg_value=float(np.mean(conc20_values)),
-        value_label="Норм. концентрация 20%",
-        customdata=customdata,
+        values=conc20_values,
+        value_label="Концентрация 20%",
+        indices=frame_indices,
         color="#a64ac9",
     )
 
@@ -828,48 +860,45 @@ def compute_figures(frame_samples: Sequence[FrameSample], pair_samples: Sequence
             [pair.start_index, pair.end_index, f"{pair.start_index:04d}-{pair.end_index:04d}"]
             for pair in pair_samples
         ]
-        mean_abs_values = [float(np.clip(pair.diff_metrics['mean_abs'], 0.0, 1.0)) for pair in pair_samples]
-        rms_values = [float(np.clip(pair.diff_metrics['rms'], 0.0, 1.0)) for pair in pair_samples]
-        max_abs_values = [float(np.clip(pair.diff_metrics['max_abs'], 0.0, 1.0)) for pair in pair_samples]
-        distance_values = [float(np.clip(pair.maxima_distance_normalized, 0.0, 1.0)) for pair in pair_samples]
+        mean_abs_values = [float(pair.diff_metrics['mean_abs']) for pair in pair_samples]
+        rms_values = [float(pair.diff_metrics['rms']) for pair in pair_samples]
+        max_abs_values = [float(pair.diff_metrics['max_abs']) for pair in pair_samples]
+        distance_values = [float(pair.maxima_distance_normalized) for pair in pair_samples]
 
         figures['vol1_mean_abs'] = build_pair_figure(
             title="Volatility1 — Mean |Δ| (средняя амплитуда изменений)",
             x_labels=pair_labels,
-            y_values=mean_abs_values,
-            avg_value=float(np.mean(mean_abs_values)),
-            value_label="Норм. Mean |Δ|",
+            values=mean_abs_values,
+            value_label="Mean |Δ|",
             customdata=pair_customdata,
             color="#4c6ef5",
         )
         figures['vol1_rms'] = build_pair_figure(
             title="Volatility1 — RMS Δ (среднеквадратичное изменение)",
             x_labels=pair_labels,
-            y_values=rms_values,
-            avg_value=float(np.mean(rms_values)),
-            value_label="Норм. RMS Δ",
+            values=rms_values,
+            value_label="RMS Δ",
             customdata=pair_customdata,
             color="#fa8c16",
         )
         figures['vol1_max_abs'] = build_pair_figure(
             title="Volatility1 — Max |Δ| (наибольший скачок)",
             x_labels=pair_labels,
-            y_values=max_abs_values,
-            avg_value=float(np.mean(max_abs_values)),
-            value_label="Норм. Max |Δ|",
+            values=max_abs_values,
+            value_label="Max |Δ|",
             customdata=pair_customdata,
             color="#ff4d4f",
         )
         figures['vol2_distance'] = build_pair_figure(
             title="Volatility2 — смещение максимума внимания",
             x_labels=pair_labels,
-            y_values=distance_values,
-            avg_value=float(np.mean(distance_values)),
-            value_label="Норм. расстояние",
+            values=distance_values,
+            value_label="Нормированное расстояние",
             customdata=[data + [pair.maxima_distance] for data, pair in zip(pair_customdata, pair_samples)],
             color="#13a8a8",
             hovertemplate=(
-                "Кадры %{x}<br>Норм. расстояние: %{y:.4f}<br>"
+                "Кадры %{x}<br>Норм. расстояние (исходное): %{customdata[4]:.4f}<br>"
+                "Норм. расстояние (масштаб): %{y:.4f}<br>"
                 "Фактическое: %{customdata[3]:.1f} px<extra></extra>"
             ),
         )
