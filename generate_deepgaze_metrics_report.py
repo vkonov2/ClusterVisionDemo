@@ -47,6 +47,7 @@ class PairSample:
     end_index: int
     diff_metrics: Dict[str, float]
     maxima_distance: float
+    maxima_distance_normalized: float
     diff_image_b64: str
     distance_image_b64: str
 
@@ -93,6 +94,7 @@ def render_maxima_distance_overlay(
     first_max: tuple[int, int],
     second_max: tuple[int, int],
     distance: float,
+    distance_norm: float,
 ) -> np.ndarray:
     overlay = base_overlay.copy()
     color_first = (0, 255, 255)
@@ -106,9 +108,10 @@ def render_maxima_distance_overlay(
         (0, 255, 0),
         thickness=2,
     )
+    label = f"{distance:.1f}px · {distance_norm:.2f}"
     cv2.putText(
         overlay,
-        f"{distance:.1f}px",
+        label,
         (20, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
         1.0,
@@ -151,6 +154,13 @@ def compute_frame_samples(predictions: Sequence[DeepGazePrediction]) -> List[Fra
 
 def compute_pair_samples(frames: Sequence[FrameSample]) -> List[PairSample]:
     pairs: List[PairSample] = []
+    if len(frames) < 2:
+        return pairs
+
+    prob_height, prob_width = frames[0].prob_map.shape
+    diagonal = float(np.hypot(prob_height, prob_width))
+    diagonal = max(diagonal, 1.0)
+
     for current, nxt in zip(frames[:-1], frames[1:]):
         diff_map = nxt.prob_map - current.prob_map
         diff_metrics = {
@@ -165,12 +175,14 @@ def compute_pair_samples(frames: Sequence[FrameSample]) -> List[PairSample]:
         max_a = np.array(current.max_position, dtype=np.float32)
         max_b = np.array(nxt.max_position, dtype=np.float32)
         distance = float(np.linalg.norm(max_b - max_a))
+        distance_norm = float(distance / diagonal)
 
         distance_overlay_full = render_maxima_distance_overlay(
             nxt.overlay_full,
             current.max_position,
             nxt.max_position,
             distance,
+            distance_norm,
         )
         distance_small = resize_preview(distance_overlay_full)
         distance_b64 = encode_image(distance_small)
@@ -181,6 +193,7 @@ def compute_pair_samples(frames: Sequence[FrameSample]) -> List[PairSample]:
                 end_index=nxt.index,
                 diff_metrics=diff_metrics,
                 maxima_distance=distance,
+                maxima_distance_normalized=distance_norm,
                 diff_image_b64=diff_b64,
                 distance_image_b64=distance_b64,
             ),
@@ -225,6 +238,7 @@ def build_single_frame_figure(
         yaxis_title=value_label,
         hovermode="x",
     )
+    fig.update_yaxes(range=[0, 1], constrain="domain")
     return fig
 
 
@@ -237,6 +251,7 @@ def build_pair_figure(
     value_label: str,
     customdata: Sequence[Sequence[object]],
     color: str,
+    hovertemplate: str | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
@@ -247,7 +262,10 @@ def build_pair_figure(
             marker=dict(size=8, color=color),
             line=dict(color=color),
             customdata=customdata,
-            hovertemplate="Кадры %{x}<br>" + value_label + ": %{y:.4f}<extra></extra>",
+            hovertemplate=(
+                hovertemplate
+                or ("Кадры %{x}<br>" + value_label + ": %{y:.4f}<extra></extra>")
+            ),
         ),
     )
     fig.add_hline(
@@ -266,6 +284,8 @@ def build_pair_figure(
         hovermode="x",
         xaxis_tickangle=-90,
     )
+    fig.update_xaxes(type="category")
+    fig.update_yaxes(range=[0, 1], constrain="domain")
     return fig
 
 
@@ -303,6 +323,160 @@ def render_report_html(
     else:
         initial_pair_a = initial_frame_key
         initial_pair_b = initial_frame_key
+
+    def format_frame_caption(label: str, key: str, *, default: str = "Наведите курсор на график") -> str:
+        if not key:
+            return default
+        try:
+            number = int(key) + 1
+        except ValueError:
+            return default
+        normalized_label = label.strip().lower()
+        if normalized_label.startswith("кадр"):
+            return f"{label} · {number}"
+        return f"{label} · кадр {number}"
+
+    def format_pair_label(a_key: str, b_key: str) -> str:
+        try:
+            a_num = int(a_key) + 1
+            b_num = int(b_key) + 1
+        except (ValueError, TypeError):
+            return ""
+        return f"{a_num}-{b_num}"
+
+    initial_pair_label = format_pair_label(initial_pair_a, initial_pair_b)
+    initial_pair_distance_value = pair_samples[0].maxima_distance if pair_samples else None
+
+    single_metric_definitions = [
+        (
+            "mean",
+            "Mean",
+            "Mean — средняя вероятность по кадру, показывающая общий уровень распределённого внимания.",
+        ),
+        (
+            "peak",
+            "Peak",
+            "Peak — максимальная вероятность в кадре, отражающая силу наиболее заметной области.",
+        ),
+        (
+            "conc10",
+            "Concentration 10%",
+            "Concentration 10% — доля вероятности в верхних 10% пикселей, характеризующая компактность внимания.",
+        ),
+        (
+            "conc20",
+            "Concentration 20%",
+            "Concentration 20% — доля вероятности в верхних 20% пикселей, фиксирующая ширину зоны интереса.",
+        ),
+    ]
+
+    single_metrics_html = "".join(
+        f"""
+            <div class=\"metric-block\">
+                <div class=\"figure\">{figures[key]}</div>
+                <p class=\"metric-note\">{description}</p>
+                <div class=\"metric-preview-wrapper\">
+                    <div class=\"preview-card\">
+                        <h3>{display} · выбранный кадр</h3>
+                        <img id=\"{key}-preview\" src=\"{frame_overlays.get(initial_frame_key, '')}\" alt=\"{display} overlay\" />
+                        <div class=\"caption\" id=\"{key}-caption\">{format_frame_caption(display, initial_frame_key)}</div>
+                    </div>
+                </div>
+            </div>
+        """
+        for key, display, description in single_metric_definitions
+    )
+
+    volatility1_definitions = [
+        (
+            "vol1_mean_abs",
+            "vol1-mean",
+            "Mean |Δ|",
+            "Mean |Δ| — среднее абсолютное изменение между соседними картами, показывающее, насколько сильно перераспределяется внимание.",
+        ),
+        (
+            "vol1_rms",
+            "vol1-rms",
+            "RMS Δ",
+            "RMS Δ — среднеквадратичное изменение, чувствительное к единичным резким скачкам внимания.",
+        ),
+        (
+            "vol1_max_abs",
+            "vol1-max",
+            "Max |Δ|",
+            "Max |Δ| — максимальное точечное изменение вероятности, отражающее самый заметный локальный сдвиг.",
+        ),
+    ]
+
+    if pair_samples:
+        initial_pair_caption_a = format_frame_caption("Кадр A", initial_pair_a, default="Наведите курсор")
+        initial_pair_caption_b = format_frame_caption("Кадр B", initial_pair_b, default="Наведите курсор")
+        if initial_pair_label:
+            distance_suffix = (
+                f" ({initial_pair_distance_value:.1f} px)"
+                if initial_pair_distance_value is not None
+                else ""
+            )
+            initial_distance_caption = f"Смещение максимума · {initial_pair_label}{distance_suffix}"
+        else:
+            initial_distance_caption = "Наведите курсор"
+
+        volatility1_html = "".join(
+            f"""
+                <div class=\"metric-block\">
+                    <div class=\"figure\">{figures[key]}</div>
+                    <p class=\"metric-note\">{description}</p>
+                    <div class=\"pair-preview-grid\">
+                        <div class=\"preview-card\">
+                            <h3>Кадр A</h3>
+                            <img id=\"{prefix}-frame-a\" src=\"{frame_overlays.get(initial_pair_a, '')}\" alt=\"frame A\" />
+                            <div class=\"caption\" id=\"{prefix}-caption-a\">{initial_pair_caption_a}</div>
+                        </div>
+                        <div class=\"preview-card\">
+                            <h3>Кадр B</h3>
+                            <img id=\"{prefix}-frame-b\" src=\"{frame_overlays.get(initial_pair_b, '')}\" alt=\"frame B\" />
+                            <div class=\"caption\" id=\"{prefix}-caption-b\">{initial_pair_caption_b}</div>
+                        </div>
+                        <div class=\"preview-card\">
+                            <h3>Разность карт</h3>
+                            <img id=\"{prefix}-third\" src=\"{pair_diff_images.get(initial_pair_key, '')}\" alt=\"difference\" />
+                        <div class=\"caption\" id=\"{prefix}-caption-third\">{((display + ' · ' + initial_pair_label) if initial_pair_label else 'Наведите курсор')}</div>
+                        </div>
+                    </div>
+                </div>
+            """
+            for key, prefix, display, description in volatility1_definitions
+        )
+    else:
+        volatility1_html = '<p class="empty-note">Недостаточно кадров для расчёта (нужно ≥2).</p>'
+
+    if pair_samples:
+        vol2_prefix = "vol2-distance"
+        volatility2_html = f"""
+            <div class=\"metric-block\">
+                <div class=\"figure\">{figures['vol2_distance']}</div>
+                <p class=\"metric-note\">Нормированное расстояние между максимумами показывает, насколько далеко смещается главный пик внимания между соседними кадрами.</p>
+                <div class=\"pair-preview-grid\">
+                    <div class=\"preview-card\">
+                        <h3>Кадр A</h3>
+                        <img id=\"{vol2_prefix}-frame-a\" src=\"{frame_overlays.get(initial_pair_a, '')}\" alt=\"frame A\" />
+                        <div class=\"caption\" id=\"{vol2_prefix}-caption-a\">{initial_pair_caption_a}</div>
+                    </div>
+                    <div class=\"preview-card\">
+                        <h3>Кадр B</h3>
+                        <img id=\"{vol2_prefix}-frame-b\" src=\"{frame_overlays.get(initial_pair_b, '')}\" alt=\"frame B\" />
+                        <div class=\"caption\" id=\"{vol2_prefix}-caption-b\">{initial_pair_caption_b}</div>
+                    </div>
+                    <div class=\"preview-card\">
+                        <h3>Максимумы и расстояние</h3>
+                        <img id=\"{vol2_prefix}-third\" src=\"{pair_distance_images.get(initial_pair_key, '')}\" alt=\"distance\" />
+                        <div class=\"caption\" id=\"{vol2_prefix}-caption-third\">{initial_distance_caption}</div>
+                    </div>
+                </div>
+            </div>
+        """
+    else:
+        volatility2_html = '<p class="empty-note">Недостаточно кадров для расчёта (нужно ≥2).</p>'
 
     html = f"""
 <!DOCTYPE html>
@@ -351,13 +525,7 @@ def render_report_html(
             margin-bottom: 12px;
         }}
         .figure {{
-            margin-bottom: 24px;
-        }}
-        .preview-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-            gap: 16px;
-            margin-top: 12px;
+            margin-bottom: 16px;
         }}
         .preview-card {{
             background: #0f111a;
@@ -375,12 +543,27 @@ def render_report_html(
             border-radius: 10px;
             box-shadow: 0 8px 18px rgba(0, 0, 0, 0.35);
         }}
+        .metric-block {{
+            margin-bottom: 32px;
+        }}
+        .metric-note {{
+            margin: 0 0 16px;
+            color: #4c5166;
+            line-height: 1.5;
+        }}
+        .metric-preview-wrapper {{
+            display: flex;
+            justify-content: center;
+        }}
+        .metric-preview-wrapper .preview-card {{
+            width: 320px;
+        }}
         .caption {{
             margin-top: 12px;
             font-size: 15px;
             text-align: center;
         }}
-        .pair-previews {{
+        .pair-preview-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
             gap: 16px;
@@ -413,67 +596,21 @@ def render_report_html(
             <p class="metric-description">
                 Наведите курсор на точку графика, чтобы увидеть соответствующий кадр с тепловой картой.
             </p>
-            <div class="figure">{figures['mean']}</div>
-            <div class="figure">{figures['peak']}</div>
-            <div class="figure">{figures['conc10']}</div>
-            <div class="figure">{figures['conc20']}</div>
-            <div class="preview-grid">
-                <div class="preview-card">
-                    <h3>Карта выбранного кадра</h3>
-                    <img id="frame-preview" src="{frame_overlays.get(initial_frame_key, '')}" alt="overlay" />
-                    <div class="caption" id="frame-caption">{('Кадр ' + str(int(initial_frame_key) + 1)) if initial_frame_key else 'Наведите курсор на график'}</div>
-                </div>
-            </div>
+            {single_metrics_html}
         </section>
         <section>
             <h2>Volatility 1 — динамика изменений</h2>
             <p class="metric-description">
                 Для каждой пары соседних кадров показаны три метрики разницы тепловых карт. При наведении отображаются обе карты и их разность.
             </p>
-            {('<div class="figure">' + figures['vol1_mean_abs'] + '</div>' +
-              '<div class="figure">' + figures['vol1_rms'] + '</div>' +
-              '<div class="figure">' + figures['vol1_max_abs'] + '</div>') if pair_samples else '<p class="empty-note">Недостаточно кадров для расчёта (нужно ≥2).</p>'}
-            <div class="pair-previews">
-                <div class="preview-card">
-                    <h3>Кадр A</h3>
-                    <img id="pair-frame-a" src="{frame_overlays.get(initial_pair_a, '')}" alt="frame A" />
-                    <div class="caption" id="pair-caption-a">{(f"Кадр {int(initial_pair_a) + 1}") if initial_pair_a else ''}</div>
-                </div>
-                <div class="preview-card">
-                    <h3>Кадр B</h3>
-                    <img id="pair-frame-b" src="{frame_overlays.get(initial_pair_b, '')}" alt="frame B" />
-                    <div class="caption" id="pair-caption-b">{(f"Кадр {int(initial_pair_b) + 1}") if initial_pair_b else ''}</div>
-                </div>
-                <div class="preview-card">
-                    <h3>Разность карт</h3>
-                    <img id="pair-diff" src="{pair_diff_images.get(initial_pair_key, '')}" alt="difference" />
-                    <div class="caption" id="pair-caption-diff">{(f"Разность · {int(initial_pair_a) + 1}-{int(initial_pair_b) + 1}") if initial_pair_key else ''}</div>
-                </div>
-            </div>
+            {volatility1_html}
         </section>
         <section>
             <h2>Volatility 2 — перемещение максимума внимания</h2>
             <p class="metric-description">
                 Оценивает расстояние между точками максимума вероятности на соседних кадрах. При наведении отображается линия, соединяющая пики.
             </p>
-            {('<div class="figure">' + figures['vol2_distance'] + '</div>') if pair_samples else '<p class="empty-note">Недостаточно кадров для расчёта (нужно ≥2).</p>'}
-            <div class="pair-previews">
-                <div class="preview-card">
-                    <h3>Кадр A</h3>
-                    <img id="vol2-frame-a" src="{frame_overlays.get(initial_pair_a, '')}" alt="frame A" />
-                    <div class="caption" id="vol2-caption-a">{(f"Кадр {int(initial_pair_a) + 1}") if initial_pair_a else ''}</div>
-                </div>
-                <div class="preview-card">
-                    <h3>Кадр B</h3>
-                    <img id="vol2-frame-b" src="{frame_overlays.get(initial_pair_b, '')}" alt="frame B" />
-                    <div class="caption" id="vol2-caption-b">{(f"Кадр {int(initial_pair_b) + 1}") if initial_pair_b else ''}</div>
-                </div>
-                <div class="preview-card">
-                    <h3>Максимумы и расстояние</h3>
-                    <img id="vol2-distance" src="{pair_distance_images.get(initial_pair_key, '')}" alt="distance" />
-                    <div class="caption" id="vol2-caption-distance">{(f"Расстояние · {int(initial_pair_a) + 1}-{int(initial_pair_b) + 1}") if initial_pair_key else ''}</div>
-                </div>
-            </div>
+            {volatility2_html}
         </section>
     </main>
     <footer>Отчёт создан автоматически скриптом DeepGaze metrics.</footer>
@@ -482,74 +619,151 @@ def render_report_html(
         const pairDiffImages = {diff_json};
         const pairDistanceImages = {distance_json};
 
-        function updateFramePreview(frameIndex) {{
+        const singleMetricConfigs = [
+            {{ figureId: 'fig-mean', imgId: 'mean-preview', captionId: 'mean-caption', label: 'Mean' }},
+            {{ figureId: 'fig-peak', imgId: 'peak-preview', captionId: 'peak-caption', label: 'Peak' }},
+            {{ figureId: 'fig-conc10', imgId: 'conc10-preview', captionId: 'conc10-caption', label: 'Concentration 10%' }},
+            {{ figureId: 'fig-conc20', imgId: 'conc20-preview', captionId: 'conc20-caption', label: 'Concentration 20%' }},
+        ];
+
+        const pairMetricConfigs = [
+            {{
+                figureId: 'fig-vol1-mean-abs',
+                mode: 'vol1',
+                frameAImgId: 'vol1-mean-frame-a',
+                frameACaptionId: 'vol1-mean-caption-a',
+                frameBImgId: 'vol1-mean-frame-b',
+                frameBCaptionId: 'vol1-mean-caption-b',
+                thirdImgId: 'vol1-mean-third',
+                thirdCaptionId: 'vol1-mean-caption-third',
+                metricLabel: 'Mean |Δ|',
+                thirdSource: 'diff',
+            }},
+            {{
+                figureId: 'fig-vol1-rms',
+                mode: 'vol1',
+                frameAImgId: 'vol1-rms-frame-a',
+                frameACaptionId: 'vol1-rms-caption-a',
+                frameBImgId: 'vol1-rms-frame-b',
+                frameBCaptionId: 'vol1-rms-caption-b',
+                thirdImgId: 'vol1-rms-third',
+                thirdCaptionId: 'vol1-rms-caption-third',
+                metricLabel: 'RMS Δ',
+                thirdSource: 'diff',
+            }},
+            {{
+                figureId: 'fig-vol1-max-abs',
+                mode: 'vol1',
+                frameAImgId: 'vol1-max-frame-a',
+                frameACaptionId: 'vol1-max-caption-a',
+                frameBImgId: 'vol1-max-frame-b',
+                frameBCaptionId: 'vol1-max-caption-b',
+                thirdImgId: 'vol1-max-third',
+                thirdCaptionId: 'vol1-max-caption-third',
+                metricLabel: 'Max |Δ|',
+                thirdSource: 'diff',
+            }},
+            {{
+                figureId: 'fig-vol2-distance',
+                mode: 'vol2',
+                frameAImgId: 'vol2-distance-frame-a',
+                frameACaptionId: 'vol2-distance-caption-a',
+                frameBImgId: 'vol2-distance-frame-b',
+                frameBCaptionId: 'vol2-distance-caption-b',
+                thirdImgId: 'vol2-distance-third',
+                thirdCaptionId: 'vol2-distance-caption-third',
+                metricLabel: 'Смещение максимума',
+                thirdSource: 'distance',
+                distanceIndex: 3,
+            }},
+        ];
+
+        function updateSingleMetricPreview(config, frameIndex) {{
             const key = String(frameIndex);
-            const img = document.getElementById('frame-preview');
-            const caption = document.getElementById('frame-caption');
-            if (frameOverlays[key]) {{
-                img.src = frameOverlays[key];
-                caption.textContent = `Кадр ${{Number(frameIndex) + 1}}`;
-            }}
+            const overlay = frameOverlays[key];
+            if (!overlay) return;
+            const img = document.getElementById(config.imgId);
+            const caption = document.getElementById(config.captionId);
+            if (!img || !caption) return;
+            img.src = overlay;
+            caption.textContent = `${{config.label}} · кадр ${{Number(frameIndex) + 1}}`;
         }}
 
-        function updatePairPreview(prefix, frameA, frameB, pairKey, mode) {{
-            const aImg = document.getElementById(prefix + '-frame-a');
-            const bImg = document.getElementById(prefix + '-frame-b');
-            const cImg = document.getElementById(prefix + (mode === 'vol1' ? '-diff' : '-distance'));
-            const aCap = document.getElementById(prefix + '-caption-a');
-            const bCap = document.getElementById(prefix + '-caption-b');
-            const cCap = document.getElementById(prefix + (mode === 'vol1' ? '-caption-diff' : '-caption-distance'));
+        function updatePairMetricPreview(config, frameA, frameB, pairKey, data) {{
             const pairLabel = `${{Number(frameA) + 1}}-{{Number(frameB) + 1}}`;
-            if (frameOverlays[String(frameA)]) {{
-                aImg.src = frameOverlays[String(frameA)];
-                aCap.textContent = `Кадр ${{Number(frameA) + 1}}`;
+            const frameAKey = String(frameA);
+            const frameBKey = String(frameB);
+            const imgA = document.getElementById(config.frameAImgId);
+            const imgB = document.getElementById(config.frameBImgId);
+            const capA = document.getElementById(config.frameACaptionId);
+            const capB = document.getElementById(config.frameBCaptionId);
+            const thirdImg = document.getElementById(config.thirdImgId);
+            const thirdCap = document.getElementById(config.thirdCaptionId);
+
+            if (imgA && frameOverlays[frameAKey]) {{
+                imgA.src = frameOverlays[frameAKey];
             }}
-            if (frameOverlays[String(frameB)]) {{
-                bImg.src = frameOverlays[String(frameB)];
-                bCap.textContent = `Кадр ${{Number(frameB) + 1}}`;
+            if (capA) {{
+                capA.textContent = `Кадр ${{Number(frameA) + 1}}`;
             }}
-            if (mode === 'vol1') {{
-                if (pairDiffImages[pairKey]) {{
-                    cImg.src = pairDiffImages[pairKey];
-                    cCap.textContent = `Разность · ${{pairLabel}}`;
+            if (imgB && frameOverlays[frameBKey]) {{
+                imgB.src = frameOverlays[frameBKey];
+            }}
+            if (capB) {{
+                capB.textContent = `Кадр ${{Number(frameB) + 1}}`;
+            }}
+
+            let thirdOverlay = null;
+            if (config.thirdSource === 'diff') {{
+                thirdOverlay = pairDiffImages[pairKey];
+            }} else if (config.thirdSource === 'distance') {{
+                thirdOverlay = pairDistanceImages[pairKey];
+            }}
+            if (thirdImg && thirdOverlay) {{
+                thirdImg.src = thirdOverlay;
+            }}
+            if (thirdCap) {{
+                let captionText = config.metricLabel ? `${{config.metricLabel}} · ${{pairLabel}}` : pairLabel;
+                if (config.mode === 'vol2' && typeof config.distanceIndex === 'number' && data && data.length > config.distanceIndex) {{
+                    const actual = Number(data[config.distanceIndex]);
+                    if (!Number.isNaN(actual)) {{
+                        captionText += ` (${actual.toFixed(1)} px)`;
+                    }}
                 }}
-            }} else {{
-                if (pairDistanceImages[pairKey]) {{
-                    cImg.src = pairDistanceImages[pairKey];
-                    cCap.textContent = `Расстояние · ${{pairLabel}}`;
-                }}
+                thirdCap.textContent = captionText;
             }}
         }}
 
-        function attachSingleFrameHover(divIds) {{
-            divIds.forEach((id) => {{
-                const el = document.getElementById(id);
+        function attachSingleFrameHover(configs) {{
+            configs.forEach((config) => {{
+                const el = document.getElementById(config.figureId);
                 if (!el) return;
                 el.on('plotly_hover', (event) => {{
-                    const frameIndex = event.points[0].customdata;
-                    updateFramePreview(frameIndex);
+                    const frameIndex = event.points?.[0]?.customdata;
+                    if (frameIndex === undefined || frameIndex === null) return;
+                    updateSingleMetricPreview(config, frameIndex);
                 }});
             }});
         }}
 
-        function attachPairHover(divIds, prefix, mode) {{
-            divIds.forEach((id) => {{
-                const el = document.getElementById(id);
+        function attachPairHover(configs) {{
+            configs.forEach((config) => {{
+                const el = document.getElementById(config.figureId);
                 if (!el) return;
                 el.on('plotly_hover', (event) => {{
-                    const data = event.points[0].customdata;
+                    const data = event.points?.[0]?.customdata;
+                    if (!data || data.length < 3) return;
                     const frameA = data[0];
                     const frameB = data[1];
                     const pairKey = data[2];
-                    updatePairPreview(prefix, frameA, frameB, pairKey, mode);
+                    updatePairMetricPreview(config, frameA, frameB, pairKey, data);
                 }});
             }});
         }}
 
         window.addEventListener('load', () => {{
-            attachSingleFrameHover(['fig-mean', 'fig-peak', 'fig-conc10', 'fig-conc20']);
-            attachPairHover(['fig-vol1-mean_abs', 'fig-vol1-rms', 'fig-vol1-max_abs'], 'pair', 'vol1');
-            attachPairHover(['fig-vol2-distance'], 'vol2', 'vol2');
+            attachSingleFrameHover(singleMetricConfigs);
+            attachPairHover(pairMetricConfigs);
         }});
     </script>
 </body>
@@ -565,45 +779,45 @@ def compute_figures(frame_samples: Sequence[FrameSample], pair_samples: Sequence
     frame_numbers = [sample.index + 1 for sample in frame_samples]
     customdata = [sample.index for sample in frame_samples]
 
-    mean_values = [float(sample.prob_map.mean()) for sample in frame_samples]
-    peak_values = [float(sample.prob_map.max()) for sample in frame_samples]
-    conc10_values = [compute_concentration(sample.prob_map, 0.10) for sample in frame_samples]
-    conc20_values = [compute_concentration(sample.prob_map, 0.20) for sample in frame_samples]
+    mean_values = [float(np.clip(sample.prob_map.mean(), 0.0, 1.0)) for sample in frame_samples]
+    peak_values = [float(np.clip(sample.prob_map.max(), 0.0, 1.0)) for sample in frame_samples]
+    conc10_values = [float(np.clip(compute_concentration(sample.prob_map, 0.10), 0.0, 1.0)) for sample in frame_samples]
+    conc20_values = [float(np.clip(compute_concentration(sample.prob_map, 0.20), 0.0, 1.0)) for sample in frame_samples]
 
     figures: Dict[str, go.Figure] = {}
     figures['mean'] = build_single_frame_figure(
-        title="Mean",
+        title="Mean — средняя вероятность по кадру",
         x=frame_numbers,
         y=mean_values,
         avg_value=float(np.mean(mean_values)),
-        value_label="Mean",
+        value_label="Норм. среднее",
         customdata=customdata,
         color="#2565d0",
     )
     figures['peak'] = build_single_frame_figure(
-        title="Peak",
+        title="Peak — максимум вероятности",
         x=frame_numbers,
         y=peak_values,
         avg_value=float(np.mean(peak_values)),
-        value_label="Peak",
+        value_label="Норм. максимум",
         customdata=customdata,
         color="#e4572e",
     )
     figures['conc10'] = build_single_frame_figure(
-        title="Concentration 10%",
+        title="Concentration 10% — доля вероятности в топ-10% пикселей",
         x=frame_numbers,
         y=conc10_values,
         avg_value=float(np.mean(conc10_values)),
-        value_label="Concentration10",
+        value_label="Норм. концентрация 10%",
         customdata=customdata,
         color="#3aa17e",
     )
     figures['conc20'] = build_single_frame_figure(
-        title="Concentration 20%",
+        title="Concentration 20% — доля вероятности в топ-20% пикселей",
         x=frame_numbers,
         y=conc20_values,
         avg_value=float(np.mean(conc20_values)),
-        value_label="Concentration20",
+        value_label="Норм. концентрация 20%",
         customdata=customdata,
         color="#a64ac9",
     )
@@ -614,46 +828,50 @@ def compute_figures(frame_samples: Sequence[FrameSample], pair_samples: Sequence
             [pair.start_index, pair.end_index, f"{pair.start_index:04d}-{pair.end_index:04d}"]
             for pair in pair_samples
         ]
-        mean_abs_values = [pair.diff_metrics['mean_abs'] for pair in pair_samples]
-        rms_values = [pair.diff_metrics['rms'] for pair in pair_samples]
-        max_abs_values = [pair.diff_metrics['max_abs'] for pair in pair_samples]
-        distance_values = [pair.maxima_distance for pair in pair_samples]
+        mean_abs_values = [float(np.clip(pair.diff_metrics['mean_abs'], 0.0, 1.0)) for pair in pair_samples]
+        rms_values = [float(np.clip(pair.diff_metrics['rms'], 0.0, 1.0)) for pair in pair_samples]
+        max_abs_values = [float(np.clip(pair.diff_metrics['max_abs'], 0.0, 1.0)) for pair in pair_samples]
+        distance_values = [float(np.clip(pair.maxima_distance_normalized, 0.0, 1.0)) for pair in pair_samples]
 
         figures['vol1_mean_abs'] = build_pair_figure(
-            title="Volatility1 — Mean |Δ|",
+            title="Volatility1 — Mean |Δ| (средняя амплитуда изменений)",
             x_labels=pair_labels,
             y_values=mean_abs_values,
             avg_value=float(np.mean(mean_abs_values)),
-            value_label="Mean |Δ|",
+            value_label="Норм. Mean |Δ|",
             customdata=pair_customdata,
             color="#4c6ef5",
         )
         figures['vol1_rms'] = build_pair_figure(
-            title="Volatility1 — RMS Δ",
+            title="Volatility1 — RMS Δ (среднеквадратичное изменение)",
             x_labels=pair_labels,
             y_values=rms_values,
             avg_value=float(np.mean(rms_values)),
-            value_label="RMS Δ",
+            value_label="Норм. RMS Δ",
             customdata=pair_customdata,
             color="#fa8c16",
         )
         figures['vol1_max_abs'] = build_pair_figure(
-            title="Volatility1 — Max |Δ|",
+            title="Volatility1 — Max |Δ| (наибольший скачок)",
             x_labels=pair_labels,
             y_values=max_abs_values,
             avg_value=float(np.mean(max_abs_values)),
-            value_label="Max |Δ|",
+            value_label="Норм. Max |Δ|",
             customdata=pair_customdata,
             color="#ff4d4f",
         )
         figures['vol2_distance'] = build_pair_figure(
-            title="Volatility2 — расстояние между максимумами",
+            title="Volatility2 — смещение максимума внимания",
             x_labels=pair_labels,
             y_values=distance_values,
             avg_value=float(np.mean(distance_values)),
-            value_label="Расстояние (пикс.)",
-            customdata=pair_customdata,
+            value_label="Норм. расстояние",
+            customdata=[data + [pair.maxima_distance] for data, pair in zip(pair_customdata, pair_samples)],
             color="#13a8a8",
+            hovertemplate=(
+                "Кадры %{x}<br>Норм. расстояние: %{y:.4f}<br>"
+                "Фактическое: %{customdata[3]:.1f} px<extra></extra>"
+            ),
         )
 
     return {name: figure_to_html(fig, f"fig-{name.replace('_', '-')}") for name, fig in figures.items()}
