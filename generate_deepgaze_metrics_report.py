@@ -726,8 +726,8 @@ def render_report_html(
                 let captionText = config.metricLabel ? `${{config.metricLabel}} · ${{pairLabel}}` : pairLabel;
                 if (config.mode === 'vol2' && typeof config.distanceIndex === 'number' && data && data.length > config.distanceIndex) {{
                     const actual = Number(data[config.distanceIndex]);
-                    if (!Number.isNaN(actual)) {{
-                        captionText += ` (${actual.toFixed(1)} px)`;
+                    if (Number.isNaN(actual) === false) {{
+                        captionText += ` (${{actual.toFixed(1)}} px)`;
                     }}
                 }}
                 thirdCap.textContent = captionText;
