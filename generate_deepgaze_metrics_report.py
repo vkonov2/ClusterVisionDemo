@@ -488,7 +488,7 @@ def render_report_html(
             const caption = document.getElementById('frame-caption');
             if (frameOverlays[key]) {{
                 img.src = frameOverlays[key];
-                caption.textContent = `Кадр ${Number(frameIndex) + 1}`;
+                caption.textContent = `Кадр ${{Number(frameIndex) + 1}}`;
             }}
         }}
 
@@ -499,24 +499,24 @@ def render_report_html(
             const aCap = document.getElementById(prefix + '-caption-a');
             const bCap = document.getElementById(prefix + '-caption-b');
             const cCap = document.getElementById(prefix + (mode === 'vol1' ? '-caption-diff' : '-caption-distance'));
-            const pairLabel = `${Number(frameA) + 1}-${Number(frameB) + 1}`;
+            const pairLabel = `${{Number(frameA) + 1}}-{{Number(frameB) + 1}}`;
             if (frameOverlays[String(frameA)]) {{
                 aImg.src = frameOverlays[String(frameA)];
-                aCap.textContent = `Кадр ${Number(frameA) + 1}`;
+                aCap.textContent = `Кадр ${{Number(frameA) + 1}}`;
             }}
             if (frameOverlays[String(frameB)]) {{
                 bImg.src = frameOverlays[String(frameB)];
-                bCap.textContent = `Кадр ${Number(frameB) + 1}`;
+                bCap.textContent = `Кадр ${{Number(frameB) + 1}}`;
             }}
             if (mode === 'vol1') {{
                 if (pairDiffImages[pairKey]) {{
                     cImg.src = pairDiffImages[pairKey];
-                    cCap.textContent = `Разность · ${pairLabel}`;
+                    cCap.textContent = `Разность · ${{pairLabel}}`;
                 }}
             }} else {{
                 if (pairDistanceImages[pairKey]) {{
                     cImg.src = pairDistanceImages[pairKey];
-                    cCap.textContent = `Расстояние · ${pairLabel}`;
+                    cCap.textContent = `Расстояние · ${{pairLabel}}`;
                 }}
             }}
         }}
