@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+import requests
 
 CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "craft"
 REPO_DIR = CACHE_DIR / "repo"
@@ -46,18 +47,63 @@ def ensure_craft_weights(weights_path: Path = WEIGHTS_PATH) -> Path:
 
     weights_path.parent.mkdir(parents=True, exist_ok=True)
     print("Скачиваю веса CRAFT из Google Drive...")
-    try:
-        import gdown
-    except ImportError as exc:  # pragma: no cover - информативное сообщение
-        raise RuntimeError(
-            "Пакет gdown не установлен. Добавьте его в окружение: pip install gdown"
-        ) from exc
-
-    url = f"https://drive.google.com/uc?id={WEIGHTS_FILE_ID}"
-    gdown.download(url, str(weights_path), quiet=False)
+    download_file_from_google_drive(WEIGHTS_FILE_ID, weights_path)
     if not weights_path.exists():
         raise RuntimeError("Не удалось скачать веса модели CRAFT")
     return weights_path
+
+
+def download_file_from_google_drive(file_id: str, destination: Path, chunk_size: int = 32768) -> None:
+    """Загружает файл из Google Drive без сторонних зависимостей."""
+
+    session = requests.Session()
+    url = "https://docs.google.com/uc?export=download"
+    response = session.get(url, params={"id": file_id}, stream=True, timeout=30)
+    response.raise_for_status()
+
+    token = _extract_confirm_token(response)
+    if token is not None:
+        response = session.get(
+            url,
+            params={"id": file_id, "confirm": token},
+            stream=True,
+            timeout=30,
+        )
+        response.raise_for_status()
+
+    _save_response_content(response, destination, chunk_size)
+
+
+def _extract_confirm_token(response: requests.Response) -> str | None:
+    """Ищет токен подтверждения скачивания крупного файла."""
+
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            return value
+    return None
+
+
+def _save_response_content(response: requests.Response, destination: Path, chunk_size: int) -> None:
+    """Сохраняет потоковый ответ в файл с временным буфером."""
+
+    total = response.headers.get("Content-Length")
+    total_bytes = int(total) if total is not None else None
+    temp_path = destination.with_suffix(destination.suffix + ".part")
+
+    downloaded = 0
+    with temp_path.open("wb") as file_obj:
+        for chunk in response.iter_content(chunk_size):
+            if not chunk:
+                continue
+            file_obj.write(chunk)
+            downloaded += len(chunk)
+
+    temp_path.rename(destination)
+
+    if total_bytes is not None and downloaded != total_bytes:
+        raise RuntimeError(
+            "Размер скачанного файла не совпадает с ожидаемым объёмом из заголовка"
+        )
 
 
 def copy_state_dict(state_dict: dict[str, torch.Tensor]) -> OrderedDict[str, torch.Tensor]:
