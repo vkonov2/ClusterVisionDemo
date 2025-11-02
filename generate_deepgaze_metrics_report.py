@@ -6,7 +6,7 @@ import base64
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -15,6 +15,11 @@ import plotly.io as pio
 import torch
 from tqdm import tqdm
 
+from generate_craft_text_overlay_video import (
+    detect_text_boxes,
+    draw_boxes,
+    load_craft_model,
+)
 from generate_deepgaze_saliency import (
     DeepGazePrediction,
     build_centerbias,
@@ -31,6 +36,12 @@ DEFAULT_OUTPUT_DIR = Path("outputs/deepgaze_metrics")
 DEFAULT_VIDEOS_DIR = Path("data/videos")
 DEFAULT_CHUNK_SIZE = 4
 
+CRAFT_TEXT_THRESHOLD = 0.7
+CRAFT_LINK_THRESHOLD = 0.4
+CRAFT_LOW_TEXT = 0.4
+CRAFT_CANVAS_SIZE = 1280
+CRAFT_MAG_RATIO = 1.5
+
 
 @dataclass
 class FrameSample:
@@ -39,6 +50,9 @@ class FrameSample:
     overlay_full: np.ndarray
     overlay_b64: str
     max_position: tuple[int, int]
+    text_boxes: List[np.ndarray]
+    text_overlay_b64: str
+    text_energy_ratio: float
 
 
 @dataclass
@@ -133,13 +147,74 @@ def compute_concentration(prob_map: np.ndarray, top_fraction: float) -> float:
     return top_sum / total
 
 
-def compute_frame_samples(predictions: Sequence[DeepGazePrediction]) -> List[FrameSample]:
+def compute_text_energy_ratio(prob_map: np.ndarray, boxes: Sequence[np.ndarray]) -> float:
+    if not boxes:
+        return 0.0
+
+    mask = np.zeros(prob_map.shape, dtype=np.float32)
+    for box in boxes:
+        contour = np.round(box).astype(np.int32)
+        cv2.fillPoly(mask, [contour], 1.0)
+
+    energy_inside = float((prob_map * mask).sum())
+    mean_value = float(prob_map.mean())
+    if mean_value <= 1e-12:
+        return 0.0
+    pixels_in_boxes = float(mask.sum())
+    if pixels_in_boxes <= 0:
+        return 0.0
+    expected_energy = mean_value * pixels_in_boxes
+    if expected_energy <= 1e-12:
+        return 0.0
+    return energy_inside / expected_energy
+
+
+def compute_frame_samples(
+    predictions: Sequence[DeepGazePrediction],
+    *,
+    craft_model: torch.nn.Module | None = None,
+    craft_utils_module: Any | None = None,
+    craft_device: torch.device | None = None,
+    text_threshold: float = CRAFT_TEXT_THRESHOLD,
+    link_threshold: float = CRAFT_LINK_THRESHOLD,
+    low_text: float = CRAFT_LOW_TEXT,
+    canvas_size: int = CRAFT_CANVAS_SIZE,
+    mag_ratio: float = CRAFT_MAG_RATIO,
+) -> List[FrameSample]:
     samples: List[FrameSample] = []
+    use_text_detector = (
+        craft_model is not None and craft_utils_module is not None and craft_device is not None
+    )
     for pred in predictions:
         overlay_full = create_overlay(pred.frame_bgr, pred.prob_map)
         overlay_preview = resize_preview(overlay_full)
         overlay_b64 = encode_image(overlay_preview)
         max_pos = np.unravel_index(np.argmax(pred.prob_map), pred.prob_map.shape)
+
+        text_boxes: List[np.ndarray] = []
+        text_overlay_b64 = overlay_b64
+        text_energy_ratio = 0.0
+        if use_text_detector:
+            detected_boxes = detect_text_boxes(
+                pred.frame_bgr,
+                model=craft_model,
+                craft_utils_module=craft_utils_module,
+                device=craft_device,
+                text_threshold=text_threshold,
+                link_threshold=link_threshold,
+                low_text=low_text,
+                canvas_size=canvas_size,
+                mag_ratio=mag_ratio,
+            )
+            text_boxes = [box.copy() for box in detected_boxes]
+            if text_boxes:
+                overlay_with_boxes = draw_boxes(overlay_full, text_boxes)
+            else:
+                overlay_with_boxes = overlay_full
+            text_overlay_preview = resize_preview(overlay_with_boxes)
+            text_overlay_b64 = encode_image(text_overlay_preview)
+            text_energy_ratio = compute_text_energy_ratio(pred.prob_map, text_boxes)
+
         samples.append(
             FrameSample(
                 index=pred.frame_index,
@@ -147,6 +222,9 @@ def compute_frame_samples(predictions: Sequence[DeepGazePrediction]) -> List[Fra
                 overlay_full=overlay_full,
                 overlay_b64=overlay_b64,
                 max_position=(int(max_pos[0]), int(max_pos[1])),
+                text_boxes=text_boxes,
+                text_overlay_b64=text_overlay_b64,
+                text_energy_ratio=text_energy_ratio,
             ),
         )
     return samples
@@ -338,6 +416,9 @@ def render_report_html(
     figures: Dict[str, str],
 ) -> str:
     frame_overlays = {str(sample.index): sample.overlay_b64 for sample in frame_samples}
+    text_frame_overlays = {
+        str(sample.index): sample.text_overlay_b64 for sample in frame_samples
+    }
     pair_diff_images: Dict[str, str] = {}
     pair_distance_images: Dict[str, str] = {}
     for pair in pair_samples:
@@ -346,6 +427,7 @@ def render_report_html(
         pair_distance_images[key] = pair.distance_image_b64
 
     frame_json = json.dumps(frame_overlays, ensure_ascii=False)
+    text_frame_json = json.dumps(text_frame_overlays, ensure_ascii=False)
     diff_json = json.dumps(pair_diff_images, ensure_ascii=False)
     distance_json = json.dumps(pair_distance_images, ensure_ascii=False)
 
@@ -387,21 +469,31 @@ def render_report_html(
             "mean",
             "Mean",
             "Mean — средняя вероятность по кадру, показывающая общий уровень распределённого внимания.",
+            "default",
         ),
         (
             "peak",
             "Peak",
             "Peak — максимальная вероятность в кадре, отражающая силу наиболее заметной области.",
+            "default",
         ),
         (
             "conc10",
             "Concentration 10%",
             "Concentration 10% — доля вероятности в верхних 10% пикселей, характеризующая компактность внимания.",
+            "default",
         ),
         (
             "conc20",
             "Concentration 20%",
             "Concentration 20% — доля вероятности в верхних 20% пикселей, фиксирующая ширину зоны интереса.",
+            "default",
+        ),
+        (
+            "text_overlap",
+            "AOI-overlap + Text",
+            "AOI-overlap + Text — показывает, насколько энергия внимания в текстовых областях превышает средний уровень кадра.",
+            "text",
         ),
     ]
 
@@ -413,13 +505,13 @@ def render_report_html(
                 <div class=\"metric-preview-wrapper\">
                     <div class=\"preview-card\">
                         <h3>{display} · выбранный кадр</h3>
-                        <img id=\"{key}-preview\" src=\"{frame_overlays.get(initial_frame_key, '')}\" alt=\"{display} overlay\" />
+                        <img id=\"{key}-preview\" src=\"{({'text': text_frame_overlays, 'default': frame_overlays}[source]).get(initial_frame_key, '')}\" alt=\"{display} overlay\" />
                         <div class=\"caption\" id=\"{key}-caption\">{format_frame_caption(display, initial_frame_key)}</div>
                     </div>
                 </div>
             </div>
         """
-        for key, display, description in single_metric_definitions
+        for key, display, description, source in single_metric_definitions
     )
 
     volatility1_definitions = [
@@ -651,14 +743,16 @@ def render_report_html(
     <footer>Отчёт создан автоматически скриптом DeepGaze metrics.</footer>
     <script>
         const frameOverlays = {frame_json};
+        const textFrameOverlays = {text_frame_json};
         const pairDiffImages = {diff_json};
         const pairDistanceImages = {distance_json};
 
         const singleMetricConfigs = [
-            {{ figureId: 'fig-mean', imgId: 'mean-preview', captionId: 'mean-caption', label: 'Mean' }},
-            {{ figureId: 'fig-peak', imgId: 'peak-preview', captionId: 'peak-caption', label: 'Peak' }},
-            {{ figureId: 'fig-conc10', imgId: 'conc10-preview', captionId: 'conc10-caption', label: 'Concentration 10%' }},
-            {{ figureId: 'fig-conc20', imgId: 'conc20-preview', captionId: 'conc20-caption', label: 'Concentration 20%' }},
+            {{ figureId: 'fig-mean', imgId: 'mean-preview', captionId: 'mean-caption', label: 'Mean', source: 'default' }},
+            {{ figureId: 'fig-peak', imgId: 'peak-preview', captionId: 'peak-caption', label: 'Peak', source: 'default' }},
+            {{ figureId: 'fig-conc10', imgId: 'conc10-preview', captionId: 'conc10-caption', label: 'Concentration 10%', source: 'default' }},
+            {{ figureId: 'fig-conc20', imgId: 'conc20-preview', captionId: 'conc20-caption', label: 'Concentration 20%', source: 'default' }},
+            {{ figureId: 'fig-text-overlap', imgId: 'text_overlap-preview', captionId: 'text_overlap-caption', label: 'AOI-overlap + Text', source: 'text' }},
         ];
 
         const pairMetricConfigs = [
@@ -715,7 +809,8 @@ def render_report_html(
 
         function updateSingleMetricPreview(config, frameIndex) {{
             const key = String(frameIndex);
-            const overlay = frameOverlays[key];
+            const sourceMap = config.source === 'text' ? textFrameOverlays : frameOverlays;
+            const overlay = sourceMap[key];
             if (!overlay) return;
             const img = document.getElementById(config.imgId);
             const caption = document.getElementById(config.captionId);
@@ -819,6 +914,7 @@ def compute_figures(frame_samples: Sequence[FrameSample], pair_samples: Sequence
     peak_values = [float(sample.prob_map.max()) for sample in frame_samples]
     conc10_values = [float(compute_concentration(sample.prob_map, 0.10)) for sample in frame_samples]
     conc20_values = [float(compute_concentration(sample.prob_map, 0.20)) for sample in frame_samples]
+    text_overlap_values = [float(sample.text_energy_ratio) for sample in frame_samples]
 
     figures: Dict[str, go.Figure] = {}
     figures['mean'] = build_single_frame_figure(
@@ -852,6 +948,14 @@ def compute_figures(frame_samples: Sequence[FrameSample], pair_samples: Sequence
         value_label="Концентрация 20%",
         indices=frame_indices,
         color="#a64ac9",
+    )
+    figures['text_overlap'] = build_single_frame_figure(
+        title="AOI-overlap + Text — относительная энергия в текстовых областях",
+        x=frame_numbers,
+        values=text_overlap_values,
+        value_label="Отн. энергия текста",
+        indices=frame_indices,
+        color="#d97706",
     )
 
     if pair_samples:
@@ -916,6 +1020,14 @@ def process_video(
     device: torch.device,
     centerbias_template: np.ndarray,
     output_dir: Path,
+    craft_model: torch.nn.Module,
+    craft_utils_module: Any,
+    craft_device: torch.device,
+    text_threshold: float,
+    link_threshold: float,
+    low_text: float,
+    canvas_size: int,
+    mag_ratio: float,
 ) -> None:
     frames_info = read_video_frames(video_path, seconds, frame_skip)
     height, width = frames_info.frame_size
@@ -931,7 +1043,17 @@ def process_video(
         ),
     )
 
-    frame_samples = compute_frame_samples(predictions)
+    frame_samples = compute_frame_samples(
+        predictions,
+        craft_model=craft_model,
+        craft_utils_module=craft_utils_module,
+        craft_device=craft_device,
+        text_threshold=text_threshold,
+        link_threshold=link_threshold,
+        low_text=low_text,
+        canvas_size=canvas_size,
+        mag_ratio=mag_ratio,
+    )
     pair_samples = compute_pair_samples(frame_samples)
     figures_html = compute_figures(frame_samples, pair_samples)
 
@@ -978,6 +1100,7 @@ def main() -> int:
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = load_deepgaze_model(repo_dir, "deepgaze2e", device)
+    craft_model, craft_utils_module = load_craft_model(device)
 
     if args.video is not None:
         videos = [args.video.resolve()]
@@ -998,6 +1121,14 @@ def main() -> int:
             device=device,
             centerbias_template=centerbias_template,
             output_dir=args.output.resolve(),
+            craft_model=craft_model,
+            craft_utils_module=craft_utils_module,
+            craft_device=device,
+            text_threshold=CRAFT_TEXT_THRESHOLD,
+            link_threshold=CRAFT_LINK_THRESHOLD,
+            low_text=CRAFT_LOW_TEXT,
+            canvas_size=CRAFT_CANVAS_SIZE,
+            mag_ratio=CRAFT_MAG_RATIO,
         )
 
     return 0
