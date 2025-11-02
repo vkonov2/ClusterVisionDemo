@@ -26,16 +26,43 @@ DEFAULT_INTERMEDIATE = Path("outputs/craft/000-youtube-text-silent.mp4")
 
 
 def ensure_craft_repo(repo_dir: Path = REPO_DIR, repo_url: str = REPO_URL) -> Path:
-    """Клонирует репозиторий CRAFT при первом запуске."""
+    """Клонирует репозиторий CRAFT и применяет патчи совместимости."""
 
     repo_dir = repo_dir.expanduser().resolve()
-    if repo_dir.exists():
-        return repo_dir
+    if not repo_dir.exists():
+        repo_dir.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Клонирую CRAFT в {repo_dir}...")
+        subprocess.run(["git", "clone", repo_url, str(repo_dir)], check=True)
 
-    repo_dir.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Клонирую CRAFT в {repo_dir}...")
-    subprocess.run(["git", "clone", repo_url, str(repo_dir)], check=True)
+    patch_craft_repo_for_torchvision(repo_dir)
     return repo_dir
+
+
+def patch_craft_repo_for_torchvision(repo_dir: Path) -> None:
+    """Добавляет заглушку model_urls для современных версий torchvision."""
+
+    target = repo_dir / "basenet" / "vgg16_bn.py"
+    if not target.exists():
+        return
+
+    marker = "# torchvision>=0.15 compatibility"
+    contents = target.read_text(encoding="utf-8")
+    if marker in contents:
+        return
+
+    needle = "from torchvision.models.vgg import model_urls"
+    if needle not in contents:
+        return
+
+    replacement = (
+        "try:\n"
+        "    from torchvision.models.vgg import model_urls  # type: ignore\n"
+        "except ImportError:  # torchvision>=0.15 compatibility\n"
+        "    from torchvision.models import VGG16_BN_Weights\n"
+        "    model_urls = {\"vgg16_bn\": VGG16_BN_Weights.IMAGENET1K_V1.url}\n"
+    )
+
+    target.write_text(contents.replace(needle, replacement, 1), encoding="utf-8")
 
 
 def ensure_craft_weights(weights_path: Path = WEIGHTS_PATH) -> Path:
