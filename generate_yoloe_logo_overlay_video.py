@@ -110,15 +110,9 @@ def _compute_histogram(image_bgr: np.ndarray) -> np.ndarray:
     return cv2.normalize(hist, hist).flatten()
 
 
-def load_logo_templates(logo_dir: Path) -> list[LogoTemplate]:
-    """Загружает изображения логотипов и подготавливает их к сравнению."""
-
-    logo_dir = logo_dir.expanduser()
-    if not logo_dir.exists() or not logo_dir.is_dir():
-        raise FileNotFoundError(f"Каталог с логотипами не найден: {logo_dir}")
-
+def _prepare_logo_templates(image_paths: Sequence[Path]) -> list[LogoTemplate]:
     templates: list[LogoTemplate] = []
-    for image_path in sorted(logo_dir.iterdir()):
+    for image_path in image_paths:
         if image_path.suffix.lower() not in LOGO_EXTENSIONS:
             continue
         image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -140,8 +134,21 @@ def load_logo_templates(logo_dir: Path) -> list[LogoTemplate]:
         )
 
     if not templates:
-        raise RuntimeError(f"В каталоге {logo_dir} отсутствуют поддерживаемые изображения логотипов")
+        raise RuntimeError("Не удалось подготовить изображения логотипов для сравнения")
     return templates
+
+
+def load_logo_templates(logo_source: Path) -> list[LogoTemplate]:
+    """Загружает изображения логотипов и подготавливает их к сравнению."""
+
+    logo_source = logo_source.expanduser()
+    if logo_source.is_dir():
+        image_paths = sorted(logo_source.iterdir())
+        return _prepare_logo_templates(image_paths)
+    if logo_source.is_file():
+        return _prepare_logo_templates([logo_source])
+
+    raise FileNotFoundError(f"Каталог или файл с логотипами не найден: {logo_source}")
 
 
 def detect_with_yolo(
@@ -421,9 +428,21 @@ def build_jobs(args: argparse.Namespace) -> list[VideoJob]:
     for video_path in video_paths:
         logo_dir = logos_root / video_path.stem
         try:
-            logos = load_logo_templates(logo_dir)
-        except FileNotFoundError:
-            print(f"Пропускаю {video_path.name}: каталог логотипов {logo_dir} не найден")
+            if logo_dir.is_dir() or logo_dir.is_file():
+                logos = load_logo_templates(logo_dir)
+            else:
+                candidate_files = sorted(
+                    p
+                    for p in logos_root.glob(f"{video_path.stem}*")
+                    if p.is_file()
+                )
+                if not candidate_files:
+                    raise FileNotFoundError(
+                        f"каталог или файл с логотипами {logo_dir} не найден"
+                    )
+                logos = _prepare_logo_templates(candidate_files)
+        except FileNotFoundError as error:
+            print(f"Пропускаю {video_path.name}: {error}")
             continue
         except RuntimeError as error:
             print(f"Пропускаю {video_path.name}: {error}")
