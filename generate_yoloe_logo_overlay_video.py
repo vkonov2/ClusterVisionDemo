@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+
+import requests
 
 import cv2
 import numpy as np
@@ -18,11 +21,18 @@ from tqdm.auto import tqdm
 DEFAULT_INPUT_DIR = Path("data/videos")
 DEFAULT_LOGO_DIR = Path("data/logos")
 DEFAULT_OUTPUT_DIR = Path("outputs/logos")
-DEFAULT_MODEL = "yoloe-l.pt"
+DEFAULT_MODEL = "yoloe-11l-seg.pt"
 DEFAULT_INTERMEDIATE_SUFFIX = "-logos-silent.mp4"
 DEFAULT_OUTPUT_SUFFIX = "-logos.mp4"
 
 LOGO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+YOLOE_WEIGHT_URLS: dict[str, str] = {
+    "yoloe-11l-seg.pt": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yoloe-11l-seg.pt",
+    "yoloe-v8l-seg.pt": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yoloe-v8l-seg.pt",
+    "yoloe-11l-seg-pf.pt": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yoloe-11l-seg-pf.pt",
+    "yoloe-v8l-seg-pf.pt": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yoloe-v8l-seg-pf.pt",
+}
 
 
 @dataclass(frozen=True)
@@ -69,6 +79,9 @@ class VideoJob:
     merge_audio: bool
 
 
+YOLOE_CACHE_DIR = Path(".cache/yoloe")
+
+
 def ensure_ultralytics() -> None:
     """Гарантирует наличие пакета ultralytics в окружении."""
 
@@ -83,6 +96,33 @@ def ensure_ultralytics() -> None:
         import ultralytics  # type: ignore  # noqa: F401
 
 
+def ensure_weight_file(model_name: str) -> Path:
+    """Возвращает путь к файлу весов YOLOE, скачивая его при необходимости."""
+
+    candidate = Path(model_name)
+    if candidate.exists():
+        return candidate
+
+    url = YOLOE_WEIGHT_URLS.get(model_name)
+    if url is None:
+        raise FileNotFoundError(
+            f"Файл весов {model_name} не найден и не известен среди заранее определённых ссылок"
+        )
+
+    YOLOE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    destination = YOLOE_CACHE_DIR / model_name
+    if destination.exists():
+        return destination
+
+    print(f"Скачиваю веса модели {model_name}...")
+    with requests.get(url, stream=True, timeout=60) as response:
+        response.raise_for_status()
+        with destination.open("wb") as target:
+            shutil.copyfileobj(response.raw, target)
+
+    return destination
+
+
 def load_yoloe_model(model_name: str = DEFAULT_MODEL, device: torch.device | None = None):
     """Загружает модель YOLOE из пакета ultralytics."""
 
@@ -92,7 +132,9 @@ def load_yoloe_model(model_name: str = DEFAULT_MODEL, device: torch.device | Non
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = YOLO(model_name)
+    weight_path = ensure_weight_file(model_name)
+
+    model = YOLO(str(weight_path))
     model.to(device)
     return model, device
 
