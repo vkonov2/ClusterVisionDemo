@@ -18,6 +18,7 @@ umap-learn
 plotly>=5.20.0
 tensorboardX>=2.6
 requests
+ultralytics>=8.2.0
 
 # --- Аудио + YAMNet ---
 tensorflow>=2.15.0
