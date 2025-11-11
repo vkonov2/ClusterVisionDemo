@@ -164,6 +164,8 @@ def main() -> int:
                 parts.append(f"conf={match.confidence:.3f}")
             if match.scale is not None:
                 parts.append(f"scale={match.scale:.2f}x")
+            if match.angle is not None:
+                parts.append(f"angle={match.angle:+.1f}°")
             parts.append(f"bbox=({x1}, {y1}, {x2}, {y2})")
             print(" - " + ", ".join(parts))
     else:

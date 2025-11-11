@@ -34,6 +34,11 @@ YOLOE_WEIGHT_URLS: dict[str, str] = {
     "yoloe-v8l-seg-pf.pt": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yoloe-v8l-seg-pf.pt",
 }
 
+TEMPLATE_SCALES: tuple[float, ...] = (0.45, 0.55, 0.65, 0.8, 0.9, 1.0, 1.15, 1.3, 1.45, 1.6)
+TEMPLATE_ANGLES: tuple[float, ...] = (-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0)
+NMS_IOU_THRESHOLD = 0.35
+MAX_TEMPLATE_MATCHES_PER_LOGO = 8
+
 
 @dataclass(frozen=True)
 class LogoTemplate:
@@ -62,6 +67,7 @@ class LogoMatch:
     method: str
     confidence: float | None = None
     scale: float | None = None
+    angle: float | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,7 @@ class VideoJob:
 
 
 YOLOE_CACHE_DIR = Path(".cache/yoloe")
+TEMPLATE_VARIANT_CACHE: dict[str, list[tuple[np.ndarray, float, float]]] = {}
 
 
 def ensure_ultralytics() -> None:
@@ -151,6 +158,57 @@ def _color_from_name(name: str) -> tuple[int, int, int]:
 def _compute_histogram(image_bgr: np.ndarray) -> np.ndarray:
     hist = cv2.calcHist([image_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
     return cv2.normalize(hist, hist).flatten()
+
+
+def _rotate_template(image_gray: np.ndarray, angle: float) -> np.ndarray:
+    """Поворачивает шаблон на заданный угол, расширяя холст при необходимости."""
+
+    if abs(angle) < 1e-3:
+        return image_gray
+
+    height, width = image_gray.shape[:2]
+    center = (width / 2.0, height / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    new_width = int((height * sin) + (width * cos))
+    new_height = int((height * cos) + (width * sin))
+    matrix[0, 2] += new_width / 2.0 - center[0]
+    matrix[1, 2] += new_height / 2.0 - center[1]
+    return cv2.warpAffine(
+        image_gray,
+        matrix,
+        (new_width, new_height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def _get_template_variants(logo: LogoTemplate) -> list[tuple[np.ndarray, float, float]]:
+    """Возвращает масштабированные и повернутые варианты шаблона."""
+
+    cache_key = logo.name
+    if cache_key in TEMPLATE_VARIANT_CACHE:
+        return TEMPLATE_VARIANT_CACHE[cache_key]
+
+    variants: list[tuple[np.ndarray, float, float]] = []
+    for scale in TEMPLATE_SCALES:
+        scaled_width = int(round(logo.width * scale))
+        scaled_height = int(round(logo.height * scale))
+        if scaled_width < 4 or scaled_height < 4:
+            continue
+        interpolation = cv2.INTER_AREA if scale <= 1.0 else cv2.INTER_CUBIC
+        scaled = cv2.resize(
+            logo.image_gray,
+            (scaled_width, scaled_height),
+            interpolation=interpolation,
+        )
+        for angle in TEMPLATE_ANGLES:
+            rotated = _rotate_template(scaled, angle)
+            variants.append((rotated, scale, angle))
+
+    TEMPLATE_VARIANT_CACHE[cache_key] = variants
+    return variants
 
 
 def _prepare_logo_templates(image_paths: Sequence[Path]) -> list[LogoTemplate]:
@@ -231,48 +289,71 @@ def _histogram_similarity(patch_bgr: np.ndarray, logo: LogoTemplate) -> float:
     return float(cv2.compareHist(hist, logo.histogram, cv2.HISTCMP_CORREL))
 
 
-def _template_match(
+def _iou(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
+    """Вычисляет IoU двух прямоугольников."""
+
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+    intersection = float((inter_x2 - inter_x1) * (inter_y2 - inter_y1))
+    area_a = float((ax2 - ax1) * (ay2 - ay1))
+    area_b = float((bx2 - bx1) * (by2 - by1))
+    union = max(area_a + area_b - intersection, 1e-6)
+    return intersection / union
+
+
+def _template_match_multi(
     frame_gray: np.ndarray,
     logo: LogoTemplate,
-    scales: Sequence[float] = (0.55, 0.65, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4),
-) -> tuple[tuple[int, int, int, int], float, float] | None:
-    """Возвращает лучшее совпадение шаблона по нескольким масштабам."""
+    template_threshold: float,
+    existing_boxes: list[tuple[int, int, int, int]],
+) -> list[LogoMatch]:
+    """Ищет несколько совпадений шаблона с учётом масштабов и поворотов."""
 
     fh, fw = frame_gray.shape[:2]
-    best: tuple[tuple[int, int, int, int], float, float] | None = None
+    raw_candidates: list[tuple[tuple[int, int, int, int], float, float, float]] = []
 
-    for scale in scales:
-        scaled_width = int(round(logo.width * scale))
-        scaled_height = int(round(logo.height * scale))
-        if scaled_width < 4 or scaled_height < 4:
+    for template, scale, angle in _get_template_variants(logo):
+        th, tw = template.shape[:2]
+        if th > fh or tw > fw:
             continue
-        if scaled_width > fw or scaled_height > fh:
-            continue
-
-        if scale == 1.0:
-            template = logo.image_gray
-        else:
-            interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
-            template = cv2.resize(
-                logo.image_gray,
-                (scaled_width, scaled_height),
-                interpolation=interpolation,
-            )
-
         result = cv2.matchTemplate(frame_gray, template, cv2.TM_CCOEFF_NORMED)
         if result.size == 0:
             continue
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
-        if max_loc is None:
-            continue
-        x1, y1 = max_loc
-        x2 = x1 + scaled_width
-        y2 = y1 + scaled_height
-        candidate = ((x1, y1, x2, y2), float(max_val), float(scale))
-        if best is None or candidate[1] > best[1]:
-            best = candidate
+        locations = np.argwhere(result >= template_threshold)
+        for y, x in locations:
+            score = float(result[y, x])
+            box = (int(x), int(y), int(x + tw), int(y + th))
+            raw_candidates.append((box, score, scale, angle))
 
-    return best
+    raw_candidates.sort(key=lambda item: item[1], reverse=True)
+
+    selected: list[LogoMatch] = []
+    occupied = existing_boxes[:]
+    for box, score, scale, angle in raw_candidates:
+        if len(selected) >= MAX_TEMPLATE_MATCHES_PER_LOGO:
+            break
+        if any(_iou(box, other) > NMS_IOU_THRESHOLD for other in occupied):
+            continue
+        selected.append(
+            LogoMatch(
+                logo=logo,
+                box=box,
+                score=score,
+                method="template",
+                confidence=None,
+                scale=scale,
+                angle=angle,
+            )
+        )
+        occupied.append(box)
+
+    return selected
 
 
 def detect_logos_on_frame(
@@ -287,54 +368,40 @@ def detect_logos_on_frame(
 
     detections = detect_with_yolo(frame_bgr, model, confidence_threshold)
     matches: list[LogoMatch] = []
-    used_indices: set[int] = set()
     frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-    for logo in logos:
-        best_candidate: tuple[int, tuple[int, int, int, int], float, float | None] | None = None
-        for index, (box, confidence) in enumerate(detections):
-            if index in used_indices:
-                continue
-            x1, y1, x2, y2 = box
-            patch = frame_bgr[y1:y2, x1:x2]
-            if patch.size == 0:
-                continue
+    for box, confidence in detections:
+        x1, y1, x2, y2 = box
+        patch = frame_bgr[y1:y2, x1:x2]
+        if patch.size == 0:
+            continue
+        best_logo: LogoTemplate | None = None
+        best_similarity = -1.0
+        for logo in logos:
             similarity = _histogram_similarity(patch, logo)
-            if similarity < histogram_threshold:
-                continue
-            if best_candidate is None or similarity > best_candidate[2]:
-                best_candidate = (index, box, similarity, confidence)
-
-        if best_candidate is not None:
-            index, box, similarity, confidence = best_candidate
-            used_indices.add(index)
-            matches.append(
-                LogoMatch(
-                    logo=logo,
-                    box=box,
-                    score=similarity,
-                    method="yoloe+hist",
-                    confidence=confidence,
-                )
-            )
-            continue
-
-        fallback = _template_match(frame_gray, logo)
-        if fallback is None:
-            continue
-        box, template_score, scale = fallback
-        if template_score < template_threshold:
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_logo = logo
+        if best_logo is None or best_similarity < histogram_threshold:
             continue
         matches.append(
             LogoMatch(
-                logo=logo,
+                logo=best_logo,
                 box=box,
-                score=template_score,
-                method="template",
-                confidence=None,
-                scale=scale,
+                score=best_similarity,
+                method="yoloe+hist",
+                confidence=confidence,
+                scale=None,
+                angle=None,
             )
         )
+
+    existing_boxes = [match.box for match in matches]
+    for logo in logos:
+        template_matches = _template_match_multi(frame_gray, logo, template_threshold, existing_boxes)
+        for match in template_matches:
+            matches.append(match)
+            existing_boxes.append(match.box)
 
     return matches
 
@@ -366,6 +433,8 @@ def draw_logo_matches(frame_bgr: np.ndarray, matches: Sequence[LogoMatch]) -> np
             extra_parts.append(f"score={match.score:.2f}")
             if match.scale is not None:
                 extra_parts.append(f"scale={match.scale:.2f}x")
+            if match.angle is not None and abs(match.angle) > 1e-3:
+                extra_parts.append(f"angle={match.angle:+.0f}°")
         if extra_parts:
             label = f"{label} ({', '.join(extra_parts)})"
 
