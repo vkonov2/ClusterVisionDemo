@@ -162,6 +162,8 @@ def main() -> int:
             ]
             if match.confidence is not None:
                 parts.append(f"conf={match.confidence:.3f}")
+            if match.scale is not None:
+                parts.append(f"scale={match.scale:.2f}x")
             parts.append(f"bbox=({x1}, {y1}, {x2}, {y2})")
             print(" - " + ", ".join(parts))
     else:

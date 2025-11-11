@@ -61,6 +61,7 @@ class LogoMatch:
     score: float
     method: str
     confidence: float | None = None
+    scale: float | None = None
 
 
 @dataclass(frozen=True)
@@ -230,19 +231,48 @@ def _histogram_similarity(patch_bgr: np.ndarray, logo: LogoTemplate) -> float:
     return float(cv2.compareHist(hist, logo.histogram, cv2.HISTCMP_CORREL))
 
 
-def _template_match(frame_gray: np.ndarray, logo: LogoTemplate) -> tuple[tuple[int, int, int, int], float] | None:
-    fh, fw = frame_gray.shape[:2]
-    if fh < logo.height or fw < logo.width:
-        return None
+def _template_match(
+    frame_gray: np.ndarray,
+    logo: LogoTemplate,
+    scales: Sequence[float] = (0.55, 0.65, 0.8, 0.9, 1.0, 1.1, 1.25, 1.4),
+) -> tuple[tuple[int, int, int, int], float, float] | None:
+    """Возвращает лучшее совпадение шаблона по нескольким масштабам."""
 
-    result = cv2.matchTemplate(frame_gray, logo.image_gray, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(result)
-    if max_loc is None:
-        return None
-    x1, y1 = max_loc
-    x2 = x1 + logo.width
-    y2 = y1 + logo.height
-    return (x1, y1, x2, y2), float(max_val)
+    fh, fw = frame_gray.shape[:2]
+    best: tuple[tuple[int, int, int, int], float, float] | None = None
+
+    for scale in scales:
+        scaled_width = int(round(logo.width * scale))
+        scaled_height = int(round(logo.height * scale))
+        if scaled_width < 4 or scaled_height < 4:
+            continue
+        if scaled_width > fw or scaled_height > fh:
+            continue
+
+        if scale == 1.0:
+            template = logo.image_gray
+        else:
+            interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+            template = cv2.resize(
+                logo.image_gray,
+                (scaled_width, scaled_height),
+                interpolation=interpolation,
+            )
+
+        result = cv2.matchTemplate(frame_gray, template, cv2.TM_CCOEFF_NORMED)
+        if result.size == 0:
+            continue
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if max_loc is None:
+            continue
+        x1, y1 = max_loc
+        x2 = x1 + scaled_width
+        y2 = y1 + scaled_height
+        candidate = ((x1, y1, x2, y2), float(max_val), float(scale))
+        if best is None or candidate[1] > best[1]:
+            best = candidate
+
+    return best
 
 
 def detect_logos_on_frame(
@@ -292,7 +322,7 @@ def detect_logos_on_frame(
         fallback = _template_match(frame_gray, logo)
         if fallback is None:
             continue
-        box, template_score = fallback
+        box, template_score, scale = fallback
         if template_score < template_threshold:
             continue
         matches.append(
@@ -302,6 +332,7 @@ def detect_logos_on_frame(
                 score=template_score,
                 method="template",
                 confidence=None,
+                scale=scale,
             )
         )
 
@@ -333,6 +364,8 @@ def draw_logo_matches(frame_bgr: np.ndarray, matches: Sequence[LogoMatch]) -> np
                 extra_parts.append(f"conf={match.confidence:.2f}")
         else:
             extra_parts.append(f"score={match.score:.2f}")
+            if match.scale is not None:
+                extra_parts.append(f"scale={match.scale:.2f}x")
         if extra_parts:
             label = f"{label} ({', '.join(extra_parts)})"
 
