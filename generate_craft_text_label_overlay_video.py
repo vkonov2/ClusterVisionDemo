@@ -17,6 +17,8 @@ import requests
 import torch
 from tqdm.auto import tqdm
 
+from PIL import Image, ImageDraw, ImageFont
+
 
 CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "craft"
 REPO_DIR = CACHE_DIR / "repo"
@@ -36,6 +38,7 @@ class LabeledBox:
     contour: np.ndarray
     label: str
     recognized: str
+    score: float
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,32 @@ class LabelTemplate:
     image: np.ndarray
     inverted: np.ndarray
     threshold: float
+
+
+_FONT_CACHE: dict[int, ImageFont.ImageFont] = {}
+
+
+def _get_font(size: int) -> ImageFont.ImageFont:
+    """Подбирает шрифт с поддержкой кириллицы и кеширует результат."""
+
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+
+    candidate_paths = (
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/freefont/FreeSans.ttf"),
+    )
+
+    for path in candidate_paths:
+        if path.exists():
+            font = ImageFont.truetype(str(path), size=size)
+            _FONT_CACHE[size] = font
+            return font
+
+    font = ImageFont.load_default()
+    _FONT_CACHE[size] = font
+    return font
 
 
 def _render_text_template(
@@ -85,36 +114,50 @@ def build_label_templates(labels: Sequence[str]) -> list[LabelTemplate]:
         if not raw:
             continue
 
-        tokens = {raw}
-        tokens.update(token for token in re.split(r"[^0-9A-Za-zА-Яа-яЁё]+", raw) if token)
+        raw_tokens = {raw}
+        raw_tokens.update(token for token in re.split(r"[^0-9A-Za-zА-Яа-яЁё]+", raw) if token)
 
-        for token in tokens:
+        for token in raw_tokens:
             normalized_token = token.strip()
             if not normalized_token:
                 continue
 
-            for scale in (0.8, 1.0, 1.2, 1.5):
-                for thickness in (1, 2):
-                    rendered = _render_text_template(normalized_token, scale=scale, thickness=thickness)
-                    if rendered is None:
-                        continue
+            variants = {
+                normalized_token,
+                normalized_token.lower(),
+                normalized_token.upper(),
+                normalized_token.casefold(),
+                normalized_token.title(),
+            }
 
-                    key = (label, normalized_token, rendered.shape[0], rendered.shape[1])
-                    if key in seen_keys:
-                        continue
+            for variant in {item for item in variants if item.strip()}:
+                cleaned = variant.strip()
+                visible_length = len(re.sub(r"\s+", "", cleaned))
+                if not cleaned or visible_length == 0:
+                    continue
 
-                    seen_keys.add(key)
-                    inverted = 1.0 - rendered
-                    threshold = 0.55 if len(normalized_token) >= 4 else 0.65
-                    templates.append(
-                        LabelTemplate(
-                            label=label,
-                            token=normalized_token,
-                            image=rendered,
-                            inverted=inverted,
-                            threshold=threshold,
+                for scale in (0.6, 0.8, 1.0, 1.2, 1.5, 1.8):
+                    for thickness in (1, 2, 3):
+                        rendered = _render_text_template(cleaned, scale=scale, thickness=thickness)
+                        if rendered is None:
+                            continue
+
+                        key = (label, cleaned, rendered.shape[0], rendered.shape[1])
+                        if key in seen_keys:
+                            continue
+
+                        seen_keys.add(key)
+                        inverted = 1.0 - rendered
+                        base_threshold = 0.45 if visible_length >= 4 else 0.52
+                        templates.append(
+                            LabelTemplate(
+                                label=label,
+                                token=cleaned,
+                                image=rendered,
+                                inverted=inverted,
+                                threshold=base_threshold,
+                            )
                         )
-                    )
 
     return templates
 
@@ -367,31 +410,43 @@ def draw_labeled_boxes(
         contour = item.contour.reshape(-1, 2).astype(np.int32)
         cv2.polylines(blended, [contour], True, (0, 255, 255), thickness=2)
 
+    pil_image = Image.fromarray(cv2.cvtColor(blended, cv2.COLOR_BGR2RGB))
+    drawer = ImageDraw.Draw(pil_image, mode="RGBA")
+    base_font_size = max(14, int(round(frame_bgr.shape[0] * 0.028)))
+    font = _get_font(base_font_size)
+
+    for item in labeled_boxes:
+        contour = item.contour.reshape(-1, 2).astype(np.int32)
         x_min = int(contour[:, 0].min())
         y_min = int(contour[:, 1].min())
-        label = f"{item.label}: {item.recognized.strip()}"
-        cv2.putText(
-            blended,
-            label,
-            (x_min, max(20, y_min - 5)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 0, 0),
-            thickness=3,
-            lineType=cv2.LINE_AA,
+        text = f"{item.label}: {item.recognized} ({item.score:.2f})".strip()
+        if not text:
+            continue
+
+        text_bbox = drawer.textbbox((0, 0), text, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+
+        origin_x = max(0, min(x_min, frame_bgr.shape[1] - text_width - 6))
+        origin_y = max(0, y_min - text_height - 6)
+        background = (0, 0, 0, 160)
+        drawer.rectangle(
+            (
+                origin_x,
+                origin_y,
+                origin_x + text_width + 6,
+                origin_y + text_height + 4,
+            ),
+            fill=background,
         )
-        cv2.putText(
-            blended,
-            label,
-            (x_min, max(20, y_min - 5)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            thickness=1,
-            lineType=cv2.LINE_AA,
+        drawer.text(
+            (origin_x + 3, origin_y + 2),
+            text,
+            font=font,
+            fill=(255, 255, 255, 255),
         )
 
-    return blended
+    return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
 
 
 def _extract_box_roi(frame_bgr: np.ndarray, contour: np.ndarray) -> np.ndarray | None:
@@ -431,16 +486,31 @@ def _match_template(search: np.ndarray, template: np.ndarray) -> float:
     if search.shape[0] < 2 or search.shape[1] < 2:
         return 0.0
 
-    tmpl = template
-    search_img = search
+    variants = [search]
+    inverted = 1.0 - search
+    variants.append(inverted)
 
-    if search_img.shape[0] < tmpl.shape[0] or search_img.shape[1] < tmpl.shape[1]:
-        tmpl = cv2.resize(tmpl, (search_img.shape[1], search_img.shape[0]), interpolation=cv2.INTER_AREA)
+    edges = cv2.Canny((search * 255).astype(np.uint8), 80, 180)
+    if edges.any():
+        variants.append(cv2.normalize(edges.astype(np.float32), None, 0.0, 1.0, cv2.NORM_MINMAX))
+
+    best = 0.0
+    for search_img in variants:
+        tmpl = template
+        if search_img.shape[0] < tmpl.shape[0] or search_img.shape[1] < tmpl.shape[1]:
+            tmpl = cv2.resize(
+                tmpl,
+                (search_img.shape[1], search_img.shape[0]),
+                interpolation=cv2.INTER_AREA,
+            )
+            result = cv2.matchTemplate(search_img, tmpl, cv2.TM_CCOEFF_NORMED)
+            best = max(best, float(result[0, 0]))
+            continue
+
         result = cv2.matchTemplate(search_img, tmpl, cv2.TM_CCOEFF_NORMED)
-        return float(result[0, 0])
+        best = max(best, float(result.max()))
 
-    result = cv2.matchTemplate(search_img, tmpl, cv2.TM_CCOEFF_NORMED)
-    return float(result.max())
+    return best
 
 
 def _find_best_template(
@@ -553,8 +623,15 @@ def select_matching_boxes(
         if score < template.threshold:
             continue
 
-        recognized = f"{template.token} ({score:.2f})"
-        matches.append(LabeledBox(contour=contour, label=template.label, recognized=recognized))
+        recognized = template.token
+        matches.append(
+            LabeledBox(
+                contour=contour,
+                label=template.label,
+                recognized=recognized,
+                score=score,
+            )
+        )
 
     return matches
 
