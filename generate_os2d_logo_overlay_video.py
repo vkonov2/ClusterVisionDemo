@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import subprocess
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -16,6 +17,13 @@ import torch
 import torchvision.transforms as T
 from PIL import Image
 from tqdm.auto import tqdm
+
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"torch\.meshgrid: in an upcoming release, it will be required to pass the indexing argument.",
+    category=UserWarning,
+)
 
 
 CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "os2d"
@@ -357,12 +365,12 @@ def detect_logos_on_frame(
 
     feature_map_size = context.feature_map_size_cls(img=input_batch)
     boxes = context.box_coder.decode_pyramid(
-        image_loc_scores_pyramid=[loc_pred[0]],
-        image_class_scores_pyramid=[class_pred[0]],
-        img_size_pyramid=[feature_map_size],
-        class_ids=list(range(len(templates))),
-        nms_iou_threshold=context.nms_iou_threshold,
+        [loc_pred[0]],
+        [class_pred[0]],
+        [feature_map_size],
+        list(range(len(templates))),
         nms_score_threshold=context.nms_score_threshold,
+        nms_iou_threshold=context.nms_iou_threshold,
         transform_corners_pyramid=[transform_corners[0]],
     )
 
