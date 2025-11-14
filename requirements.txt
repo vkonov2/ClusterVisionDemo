@@ -12,6 +12,7 @@ av
 pandas
 tqdm
 boltons
+easyocr
 yt-dlp
 openpyxl
 scikit-learn
