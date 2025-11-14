@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -15,13 +16,6 @@ import numpy as np
 import requests
 import torch
 from tqdm.auto import tqdm
-
-try:
-    import easyocr
-except ImportError as error:  # pragma: no cover - зависимость подтягивается во время выполнения
-    raise SystemExit(
-        "Пакет easyocr не установлен. Добавьте его в окружение: pip install easyocr"
-    ) from error
 
 
 CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "craft"
@@ -42,6 +36,87 @@ class LabeledBox:
     contour: np.ndarray
     label: str
     recognized: str
+
+
+@dataclass(frozen=True)
+class LabelTemplate:
+    """Шаблон текстовой подписи для сопоставления с детектированными боксами."""
+
+    label: str
+    token: str
+    image: np.ndarray
+    inverted: np.ndarray
+    threshold: float
+
+
+def _render_text_template(
+    text: str,
+    scale: float,
+    thickness: int,
+    font: int = cv2.FONT_HERSHEY_SIMPLEX,
+) -> np.ndarray | None:
+    """Создаёт шаблон текста в градациях серого."""
+
+    text = text.strip()
+    if not text:
+        return None
+
+    (width, height), baseline = cv2.getTextSize(text, font, scale, thickness)
+    width = max(width, 1)
+    height = max(height, 1)
+    canvas = np.zeros((height + baseline + 4, width + 4), dtype=np.uint8)
+    origin = (2, height + 2)
+    cv2.putText(canvas, text, origin, font, scale, 255, thickness, lineType=cv2.LINE_AA)
+
+    normalized = canvas.astype(np.float32) / 255.0
+    if float(normalized.max()) <= 0.0:
+        return None
+    return normalized
+
+
+def build_label_templates(labels: Sequence[str]) -> list[LabelTemplate]:
+    """Готовит набор шаблонов для поисковых фраз."""
+
+    templates: list[LabelTemplate] = []
+    seen_keys: set[tuple[str, str, int, int]] = set()
+
+    for label in labels:
+        raw = label.strip()
+        if not raw:
+            continue
+
+        tokens = {raw}
+        tokens.update(token for token in re.split(r"[^0-9A-Za-zА-Яа-яЁё]+", raw) if token)
+
+        for token in tokens:
+            normalized_token = token.strip()
+            if not normalized_token:
+                continue
+
+            for scale in (0.8, 1.0, 1.2, 1.5):
+                for thickness in (1, 2):
+                    rendered = _render_text_template(normalized_token, scale=scale, thickness=thickness)
+                    if rendered is None:
+                        continue
+
+                    key = (label, normalized_token, rendered.shape[0], rendered.shape[1])
+                    if key in seen_keys:
+                        continue
+
+                    seen_keys.add(key)
+                    inverted = 1.0 - rendered
+                    threshold = 0.55 if len(normalized_token) >= 4 else 0.65
+                    templates.append(
+                        LabelTemplate(
+                            label=label,
+                            token=normalized_token,
+                            image=rendered,
+                            inverted=inverted,
+                            threshold=threshold,
+                        )
+                    )
+
+    return templates
 
 
 def ensure_craft_repo(repo_dir: Path = REPO_DIR, repo_url: str = REPO_URL) -> Path:
@@ -319,6 +394,78 @@ def draw_labeled_boxes(
     return blended
 
 
+def _extract_box_roi(frame_bgr: np.ndarray, contour: np.ndarray) -> np.ndarray | None:
+    """Возвращает вырезанный по контуру регион интереса."""
+
+    contour = contour.reshape(-1, 2)
+    x_coords = contour[:, 0]
+    y_coords = contour[:, 1]
+
+    x_min = max(int(math.floor(x_coords.min())) - 2, 0)
+    y_min = max(int(math.floor(y_coords.min())) - 2, 0)
+    x_max = min(int(math.ceil(x_coords.max())) + 2, frame_bgr.shape[1])
+    y_max = min(int(math.ceil(y_coords.max())) + 2, frame_bgr.shape[0])
+
+    if x_max <= x_min or y_max <= y_min:
+        return None
+
+    roi = frame_bgr[y_min:y_max, x_min:x_max]
+    if roi.size == 0:
+        return None
+
+    return roi
+
+
+def _prepare_roi_image(roi_bgr: np.ndarray) -> np.ndarray:
+    """Готовит изображение ROI для шаблонного сравнения."""
+
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    normalized = cv2.normalize(blurred.astype(np.float32), None, 0.0, 1.0, cv2.NORM_MINMAX)
+    return normalized
+
+
+def _match_template(search: np.ndarray, template: np.ndarray) -> float:
+    """Сравнивает ROI с шаблоном и возвращает степень совпадения."""
+
+    if search.shape[0] < 2 or search.shape[1] < 2:
+        return 0.0
+
+    tmpl = template
+    search_img = search
+
+    if search_img.shape[0] < tmpl.shape[0] or search_img.shape[1] < tmpl.shape[1]:
+        tmpl = cv2.resize(tmpl, (search_img.shape[1], search_img.shape[0]), interpolation=cv2.INTER_AREA)
+        result = cv2.matchTemplate(search_img, tmpl, cv2.TM_CCOEFF_NORMED)
+        return float(result[0, 0])
+
+    result = cv2.matchTemplate(search_img, tmpl, cv2.TM_CCOEFF_NORMED)
+    return float(result.max())
+
+
+def _find_best_template(
+    roi: np.ndarray,
+    templates: Sequence[LabelTemplate],
+) -> tuple[LabelTemplate, float] | None:
+    """Подбирает шаблон с максимальным совпадением."""
+
+    best_score = 0.0
+    best_template: LabelTemplate | None = None
+
+    for template in templates:
+        score_direct = _match_template(roi, template.image)
+        score_inverted = _match_template(roi, template.inverted)
+        score = max(score_direct, score_inverted)
+        if score > best_score:
+            best_score = score
+            best_template = template
+
+    if best_template is None:
+        return None
+
+    return best_template, best_score
+
+
 def mux_audio(
     silent_video: Path,
     source_video: Path,
@@ -354,14 +501,6 @@ def mux_audio(
             f"STDOUT: {result.stdout.decode('utf-8', errors='ignore')}\n"
             f"STDERR: {result.stderr.decode('utf-8', errors='ignore')}"
         )
-
-
-def normalize_text(value: str) -> str:
-    """Приводит текст к виду для робастного сравнения."""
-
-    return "".join(ch for ch in value.lower() if ch.isalnum())
-
-
 def load_video_text_labels(texts_path: Path) -> dict[str, list[str]]:
     """Загружает сопоставление роликов и поисковых фраз."""
 
@@ -388,72 +527,34 @@ def load_video_text_labels(texts_path: Path) -> dict[str, list[str]]:
     return mapping
 
 
-def prepare_reader(use_gpu: bool | None = None) -> easyocr.Reader:
-    """Создаёт OCR-движок для распознавания текста внутри боксов."""
-
-    if use_gpu is None:
-        use_gpu = torch.cuda.is_available()
-
-    return easyocr.Reader(["ru", "en"], gpu=use_gpu)
-
-
-def recognize_box_text(reader: easyocr.Reader, frame_bgr: np.ndarray, contour: np.ndarray) -> str:
-    """Распознаёт текст внутри найденного бокса."""
-
-    x_coords = contour[:, 0]
-    y_coords = contour[:, 1]
-
-    x_min = max(int(math.floor(x_coords.min())) - 2, 0)
-    y_min = max(int(math.floor(y_coords.min())) - 2, 0)
-    x_max = min(int(math.ceil(x_coords.max())) + 2, frame_bgr.shape[1])
-    y_max = min(int(math.ceil(y_coords.max())) + 2, frame_bgr.shape[0])
-
-    if x_max <= x_min or y_max <= y_min:
-        return ""
-
-    crop_bgr = frame_bgr[y_min:y_max, x_min:x_max]
-    if crop_bgr.size == 0:
-        return ""
-
-    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    results = reader.readtext(crop_rgb, detail=0, paragraph=True)
-    if not results:
-        return ""
-
-    return " ".join(result.strip() for result in results if result.strip())
-
-
 def select_matching_boxes(
-    reader: easyocr.Reader,
     frame_bgr: np.ndarray,
     boxes: Iterable[np.ndarray],
-    labels: list[str],
+    templates: Sequence[LabelTemplate],
 ) -> list[LabeledBox]:
-    """Фильтрует боксы по совпадению распознанного текста с целевыми фразами."""
+    """Фильтрует боксы по совпадению с шаблонами текстовых подсказок."""
 
-    normalized_labels = [(label, normalize_text(label)) for label in labels if label.strip()]
-    if not normalized_labels:
+    templates = [template for template in templates if template is not None]
+    if not templates:
         return []
 
     matches: list[LabeledBox] = []
     for contour in boxes:
-        recognized = recognize_box_text(reader, frame_bgr, contour)
-        if not recognized:
+        roi_bgr = _extract_box_roi(frame_bgr, contour)
+        if roi_bgr is None:
             continue
 
-        normalized_recognized = normalize_text(recognized)
-        if not normalized_recognized:
+        roi = _prepare_roi_image(roi_bgr)
+        result = _find_best_template(roi, templates)
+        if result is None:
             continue
 
-        for label, normalized_label in normalized_labels:
-            if not normalized_label:
-                continue
-            if (
-                normalized_label in normalized_recognized
-                or normalized_recognized in normalized_label
-            ):
-                matches.append(LabeledBox(contour=contour, label=label, recognized=recognized))
-                break
+        template, score = result
+        if score < template.threshold:
+            continue
+
+        recognized = f"{template.token} ({score:.2f})"
+        matches.append(LabeledBox(contour=contour, label=template.label, recognized=recognized))
 
     return matches
 
@@ -477,8 +578,7 @@ def process_video(
     model: torch.nn.Module,
     craft_utils_module,
     device: torch.device,
-    reader: easyocr.Reader,
-    labels: list[str],
+    templates: Sequence[LabelTemplate],
     text_threshold: float,
     link_threshold: float,
     low_text: float,
@@ -514,7 +614,7 @@ def process_video(
                 mag_ratio=mag_ratio,
             )
 
-            labeled = select_matching_boxes(reader, frame, boxes, labels)
+            labeled = select_matching_boxes(frame, boxes, templates)
             overlay = draw_labeled_boxes(frame, labeled)
             writer.write(overlay)
             progress.update(1)
@@ -613,13 +713,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, craft_utils_module = load_craft_model(device)
-    reader = prepare_reader()
-
     for video_path in target_videos:
         key = video_path.stem
         labels = video_labels.get(key)
         if not labels:
             print(f"Пропускаю {video_path.name}: нет текстовой подписи в {texts_path}")
+            continue
+
+        templates = build_label_templates(labels)
+        if not templates:
+            print(f"Пропускаю {video_path.name}: не удалось подготовить шаблоны текста")
             continue
 
         output_video = output_dir / f"{video_path.stem}-text-labels.mp4"
@@ -629,8 +732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=model,
             craft_utils_module=craft_utils_module,
             device=device,
-            reader=reader,
-            labels=labels,
+            templates=templates,
             text_threshold=args.text_threshold,
             link_threshold=args.link_threshold,
             low_text=args.low_text,
