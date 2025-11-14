@@ -7,6 +7,7 @@ transformers>=4.41.0
 # --- Общие библиотеки ---
 numpy
 opencv-python
+Pillow
 av
 pandas
 tqdm
@@ -19,6 +20,7 @@ plotly>=5.20.0
 tensorboardX>=2.6
 requests
 ultralytics>=8.2.0
+yacs>=0.1.8
 
 # --- Аудио + YAMNet ---
 tensorflow>=2.15.0
