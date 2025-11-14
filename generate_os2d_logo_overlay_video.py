@@ -669,13 +669,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--score-threshold",
         type=float,
-        default=0.35,
+        default=0.95,
         help="Порог уверенности для отображения детекций",
     )
     parser.add_argument(
         "--nms-iou",
         type=float,
-        default=0.3,
+        default=0.5,
         help="IoU-порог для нефункционирующего подавления неверных дубликатов (NMS)",
     )
     parser.add_argument(
