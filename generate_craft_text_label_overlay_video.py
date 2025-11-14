@@ -7,6 +7,7 @@ import math
 import re
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -18,6 +19,7 @@ import torch
 from tqdm.auto import tqdm
 
 from PIL import Image, ImageDraw, ImageFont
+import pytesseract
 
 
 CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "craft"
@@ -42,14 +44,12 @@ class LabeledBox:
 
 
 @dataclass(frozen=True)
-class LabelTemplate:
-    """Шаблон текстовой подписи для сопоставления с детектированными боксами."""
+class LabelPattern:
+    """Структура с исходной и нормализованной формой целевой подписи."""
 
     label: str
-    token: str
-    image: np.ndarray
-    inverted: np.ndarray
-    threshold: float
+    norm: str
+    tokens: list[str]
 
 
 _FONT_CACHE: dict[int, ImageFont.ImageFont] = {}
@@ -78,88 +78,34 @@ def _get_font(size: int) -> ImageFont.ImageFont:
     return font
 
 
-def _render_text_template(
-    text: str,
-    scale: float,
-    thickness: int,
-    font: int = cv2.FONT_HERSHEY_SIMPLEX,
-) -> np.ndarray | None:
-    """Создаёт шаблон текста в градациях серого."""
+def normalize_text(text: str) -> str:
+    """Приводит распознанный текст к унифицированному виду."""
 
-    text = text.strip()
-    if not text:
-        return None
-
-    (width, height), baseline = cv2.getTextSize(text, font, scale, thickness)
-    width = max(width, 1)
-    height = max(height, 1)
-    canvas = np.zeros((height + baseline + 4, width + 4), dtype=np.uint8)
-    origin = (2, height + 2)
-    cv2.putText(canvas, text, origin, font, scale, 255, thickness, lineType=cv2.LINE_AA)
-
-    normalized = canvas.astype(np.float32) / 255.0
-    if float(normalized.max()) <= 0.0:
-        return None
-    return normalized
+    text = text.lower()
+    text = text.replace("ё", "е")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if ch.isalnum() or ch.isspace())
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-def build_label_templates(labels: Sequence[str]) -> list[LabelTemplate]:
-    """Готовит набор шаблонов для поисковых фраз."""
+def build_label_patterns(labels: Sequence[str]) -> list[LabelPattern]:
+    """Формирует набор нормализованных поисковых фраз."""
 
-    templates: list[LabelTemplate] = []
-    seen_keys: set[tuple[str, str, int, int]] = set()
-
+    patterns: list[LabelPattern] = []
     for label in labels:
         raw = label.strip()
         if not raw:
             continue
 
-        raw_tokens = {raw}
-        raw_tokens.update(token for token in re.split(r"[^0-9A-Za-zА-Яа-яЁё]+", raw) if token)
+        norm = normalize_text(raw)
+        if not norm:
+            continue
 
-        for token in raw_tokens:
-            normalized_token = token.strip()
-            if not normalized_token:
-                continue
+        tokens = [token for token in norm.split(" ") if token]
+        patterns.append(LabelPattern(label=raw, norm=norm, tokens=tokens))
 
-            variants = {
-                normalized_token,
-                normalized_token.lower(),
-                normalized_token.upper(),
-                normalized_token.casefold(),
-                normalized_token.title(),
-            }
-
-            for variant in {item for item in variants if item.strip()}:
-                cleaned = variant.strip()
-                visible_length = len(re.sub(r"\s+", "", cleaned))
-                if not cleaned or visible_length == 0:
-                    continue
-
-                for scale in (0.6, 0.8, 1.0, 1.2, 1.5, 1.8):
-                    for thickness in (1, 2, 3):
-                        rendered = _render_text_template(cleaned, scale=scale, thickness=thickness)
-                        if rendered is None:
-                            continue
-
-                        key = (label, cleaned, rendered.shape[0], rendered.shape[1])
-                        if key in seen_keys:
-                            continue
-
-                        seen_keys.add(key)
-                        inverted = 1.0 - rendered
-                        base_threshold = 0.45 if visible_length >= 4 else 0.52
-                        templates.append(
-                            LabelTemplate(
-                                label=label,
-                                token=cleaned,
-                                image=rendered,
-                                inverted=inverted,
-                                threshold=base_threshold,
-                            )
-                        )
-
-    return templates
+    return patterns
 
 
 def ensure_craft_repo(repo_dir: Path = REPO_DIR, repo_url: str = REPO_URL) -> Path:
@@ -471,69 +417,33 @@ def _extract_box_roi(frame_bgr: np.ndarray, contour: np.ndarray) -> np.ndarray |
     return roi
 
 
-def _prepare_roi_image(roi_bgr: np.ndarray) -> np.ndarray:
-    """Готовит изображение ROI для шаблонного сравнения."""
+def _preprocess_roi_for_ocr(roi_bgr: np.ndarray) -> np.ndarray:
+    """Подготавливает ROI для OCR: серый канал и усиление контраста."""
 
     gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    normalized = cv2.normalize(blurred.astype(np.float32), None, 0.0, 1.0, cv2.NORM_MINMAX)
-    return normalized
+    gray = cv2.bilateralFilter(gray, 5, 75, 75)
+    norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    _, thresh = cv2.threshold(norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return thresh
 
 
-def _match_template(search: np.ndarray, template: np.ndarray) -> float:
-    """Сравнивает ROI с шаблоном и возвращает степень совпадения."""
+def ocr_roi(roi_bgr: np.ndarray) -> str:
+    """Распознаёт текст внутри заданного ROI."""
 
-    if search.shape[0] < 2 or search.shape[1] < 2:
+    processed = _preprocess_roi_for_ocr(roi_bgr)
+    text = pytesseract.image_to_string(processed, lang="rus+eng")
+    return text
+
+
+def text_similarity(lhs_tokens: set[str], rhs_tokens: set[str]) -> float:
+    """Оценивает схожесть двух множеств токенов через индекс Жаккара."""
+
+    if not lhs_tokens or not rhs_tokens:
         return 0.0
 
-    variants = [search]
-    inverted = 1.0 - search
-    variants.append(inverted)
-
-    edges = cv2.Canny((search * 255).astype(np.uint8), 80, 180)
-    if edges.any():
-        variants.append(cv2.normalize(edges.astype(np.float32), None, 0.0, 1.0, cv2.NORM_MINMAX))
-
-    best = 0.0
-    for search_img in variants:
-        tmpl = template
-        if search_img.shape[0] < tmpl.shape[0] or search_img.shape[1] < tmpl.shape[1]:
-            tmpl = cv2.resize(
-                tmpl,
-                (search_img.shape[1], search_img.shape[0]),
-                interpolation=cv2.INTER_AREA,
-            )
-            result = cv2.matchTemplate(search_img, tmpl, cv2.TM_CCOEFF_NORMED)
-            best = max(best, float(result[0, 0]))
-            continue
-
-        result = cv2.matchTemplate(search_img, tmpl, cv2.TM_CCOEFF_NORMED)
-        best = max(best, float(result.max()))
-
-    return best
-
-
-def _find_best_template(
-    roi: np.ndarray,
-    templates: Sequence[LabelTemplate],
-) -> tuple[LabelTemplate, float] | None:
-    """Подбирает шаблон с максимальным совпадением."""
-
-    best_score = 0.0
-    best_template: LabelTemplate | None = None
-
-    for template in templates:
-        score_direct = _match_template(roi, template.image)
-        score_inverted = _match_template(roi, template.inverted)
-        score = max(score_direct, score_inverted)
-        if score > best_score:
-            best_score = score
-            best_template = template
-
-    if best_template is None:
-        return None
-
-    return best_template, best_score
+    intersection = len(lhs_tokens & rhs_tokens)
+    union = len(lhs_tokens | rhs_tokens)
+    return intersection / union
 
 
 def mux_audio(
@@ -600,12 +510,12 @@ def load_video_text_labels(texts_path: Path) -> dict[str, list[str]]:
 def select_matching_boxes(
     frame_bgr: np.ndarray,
     boxes: Iterable[np.ndarray],
-    templates: Sequence[LabelTemplate],
+    patterns: Sequence[LabelPattern],
+    similarity_threshold: float,
 ) -> list[LabeledBox]:
-    """Фильтрует боксы по совпадению с шаблонами текстовых подсказок."""
+    """Фильтрует боксы по совпадению распознанного текста с целевыми фразами."""
 
-    templates = [template for template in templates if template is not None]
-    if not templates:
+    if not patterns:
         return []
 
     matches: list[LabeledBox] = []
@@ -614,22 +524,36 @@ def select_matching_boxes(
         if roi_bgr is None:
             continue
 
-        roi = _prepare_roi_image(roi_bgr)
-        result = _find_best_template(roi, templates)
-        if result is None:
+        raw_text = ocr_roi(roi_bgr)
+        raw_text_compact = " ".join(raw_text.split())
+        norm_text = normalize_text(raw_text)
+        if not norm_text:
             continue
 
-        template, score = result
-        if score < template.threshold:
+        norm_tokens = {token for token in norm_text.split(" ") if token}
+        if not norm_tokens:
             continue
 
-        recognized = template.token
+        best_pattern: LabelPattern | None = None
+        best_score = 0.0
+
+        for pattern in patterns:
+            pattern_tokens = set(pattern.tokens)
+            score = 1.0 if pattern.norm in norm_text or norm_text in pattern.norm else text_similarity(norm_tokens, pattern_tokens)
+            if score > best_score:
+                best_score = score
+                best_pattern = pattern
+
+        if best_pattern is None or best_score < similarity_threshold:
+            continue
+
+        recognized = raw_text_compact or norm_text
         matches.append(
             LabeledBox(
                 contour=contour,
-                label=template.label,
+                label=best_pattern.label,
                 recognized=recognized,
-                score=score,
+                score=best_score,
             )
         )
 
@@ -655,12 +579,13 @@ def process_video(
     model: torch.nn.Module,
     craft_utils_module,
     device: torch.device,
-    templates: Sequence[LabelTemplate],
+    patterns: Sequence[LabelPattern],
     text_threshold: float,
     link_threshold: float,
     low_text: float,
     canvas_size: int,
     mag_ratio: float,
+    similarity_threshold: float,
 ) -> None:
     """Обрабатывает отдельный ролик и сохраняет итоговое видео."""
 
@@ -691,7 +616,12 @@ def process_video(
                 mag_ratio=mag_ratio,
             )
 
-            labeled = select_matching_boxes(frame, boxes, templates)
+            labeled = select_matching_boxes(
+                frame,
+                boxes,
+                patterns,
+                similarity_threshold=similarity_threshold,
+            )
             overlay = draw_labeled_boxes(frame, labeled)
             writer.write(overlay)
             progress.update(1)
@@ -776,6 +706,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=1.5,
         help="Коэффициент увеличения изображения перед подачей в модель",
     )
+    parser.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=0.4,
+        help="Минимальная доля совпадающих токенов между OCR и целевым текстом",
+    )
     args = parser.parse_args(argv)
 
     videos_dir = args.videos_dir.expanduser().resolve()
@@ -797,9 +733,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Пропускаю {video_path.name}: нет текстовой подписи в {texts_path}")
             continue
 
-        templates = build_label_templates(labels)
-        if not templates:
-            print(f"Пропускаю {video_path.name}: не удалось подготовить шаблоны текста")
+        patterns = build_label_patterns(labels)
+        if not patterns:
+            print(f"Пропускаю {video_path.name}: не удалось подготовить текстовые шаблоны")
             continue
 
         output_video = output_dir / f"{video_path.stem}-text-labels.mp4"
@@ -809,12 +745,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=model,
             craft_utils_module=craft_utils_module,
             device=device,
-            templates=templates,
+            patterns=patterns,
             text_threshold=args.text_threshold,
             link_threshold=args.link_threshold,
             low_text=args.low_text,
             canvas_size=args.canvas_size,
             mag_ratio=args.mag_ratio,
+            similarity_threshold=args.similarity_threshold,
         )
 
     return 0

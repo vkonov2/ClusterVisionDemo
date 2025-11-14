@@ -21,6 +21,7 @@ tensorboardX>=2.6
 requests
 ultralytics>=8.2.0
 yacs>=0.1.8
+pytesseract
 
 # --- Аудио + YAMNet ---
 tensorflow>=2.15.0
