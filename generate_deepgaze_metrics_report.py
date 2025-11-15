@@ -40,7 +40,7 @@ from generate_os2d_logo_overlay_video import (
 )
 
 
-DEFAULT_SECONDS = 5.0
+DEFAULT_SECONDS: float | None = None
 DEFAULT_OUTPUT_DIR = Path("outputs/deepgaze_metrics")
 DEFAULT_VIDEOS_DIR = Path("data/videos")
 DEFAULT_CHUNK_SIZE = 4
@@ -227,6 +227,8 @@ def compute_frame_samples(
     logo_context: Os2dModelContext | None = None,
     logo_templates: Sequence[LogoTemplate] | None = None,
     logo_score_threshold: float = 0.45,
+    progress_desc: str | None = None,
+    progress_position: int | None = None,
 ) -> List[FrameSample]:
     samples: List[FrameSample] = []
     use_text_detector = (
@@ -237,7 +239,7 @@ def compute_frame_samples(
         and logo_templates is not None
         and len(logo_templates) > 0
     )
-    for pred in predictions:
+    def process_prediction(pred: DeepGazePrediction) -> None:
         overlay_full = create_overlay(pred.frame_bgr, pred.prob_map)
         overlay_preview = resize_preview(overlay_full)
         overlay_b64 = encode_image(overlay_preview)
@@ -310,6 +312,20 @@ def compute_frame_samples(
                 logo_energy_ratio=logo_energy_ratio,
             ),
         )
+
+    if progress_desc:
+        with tqdm(
+            predictions,
+            desc=progress_desc,
+            unit="кадр",
+            total=len(predictions),
+            position=progress_position if progress_position is not None else 0,
+        ) as progress_bar:
+            for pred in progress_bar:
+                process_prediction(pred)
+    else:
+        for pred in predictions:
+            process_prediction(pred)
     return samples
 
 
@@ -492,7 +508,7 @@ def figure_to_html(fig: go.Figure, div_id: str) -> str:
 def render_report_html(
     *,
     video_path: Path,
-    seconds: float,
+    seconds: float | None,
     fps: float,
     frame_samples: Sequence[FrameSample],
     pair_samples: Sequence[PairSample],
@@ -595,6 +611,11 @@ def render_report_html(
         "text": text_frame_overlays,
         "logo": logo_frame_overlays,
     }
+
+    if seconds is None:
+        duration_label = "Полный ролик"
+    else:
+        duration_label = f"Первые {seconds:g} секунд"
 
     single_metrics_html = "".join(
         f"""
@@ -814,7 +835,7 @@ def render_report_html(
 <body>
     <header>
         <h1>DeepGaze 2e · {video_path.name}</h1>
-        <p>Первые {seconds:g} секунд, частота кадров ≈ {fps:.2f} FPS</p>
+        <p>{duration_label}, частота кадров ≈ {fps:.2f} FPS</p>
     </header>
     <main>
         <section>
@@ -1128,7 +1149,7 @@ def compute_figures(frame_samples: Sequence[FrameSample], pair_samples: Sequence
 def process_video(
     *,
     video_path: Path,
-    seconds: float,
+    seconds: float | None,
     frame_skip: int,
     chunk_size: int,
     model: torch.nn.Module,
@@ -1151,15 +1172,23 @@ def process_video(
     height, width = frames_info.frame_size
     centerbias_log = build_centerbias(height, width, uniform=False, template=centerbias_template)
 
-    predictions = list(
-        iterate_deepgaze_predictions(
+    predictions: List[DeepGazePrediction] = []
+    with tqdm(
+        total=len(frames_info.frames_bgr),
+        desc=f"{video_path.name} · DeepGaze",
+        unit="кадр",
+        position=1,
+        leave=False,
+    ) as inference_bar:
+        for prediction in iterate_deepgaze_predictions(
             frames_info.frames_bgr,
             model,
             device,
             centerbias_log,
             chunk_size=max(1, chunk_size),
-        ),
-    )
+        ):
+            predictions.append(prediction)
+            inference_bar.update(1)
 
     logo_templates: Sequence[LogoTemplate] | None = None
     if os2d_context is not None and logos_dir is not None:
@@ -1181,6 +1210,8 @@ def process_video(
         logo_context=os2d_context,
         logo_templates=logo_templates,
         logo_score_threshold=logo_score_threshold,
+        progress_desc=f"{video_path.name} · кадры",
+        progress_position=1,
     )
     pair_samples = compute_pair_samples(frame_samples)
     figures_html = compute_figures(frame_samples, pair_samples)
@@ -1213,7 +1244,12 @@ def main() -> int:
     parser.add_argument("--videos-dir", type=Path, default=DEFAULT_VIDEOS_DIR, help="Каталог с видео")
     parser.add_argument("--video", type=Path, default=None, help="Обработать только конкретный файл")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR, help="Каталог для HTML отчётов")
-    parser.add_argument("--seconds", type=float, default=DEFAULT_SECONDS, help="Длительность фрагмента")
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=DEFAULT_SECONDS,
+        help="Длительность анализируемого фрагмента (по умолчанию весь ролик)",
+    )
     parser.add_argument("--frame-skip", type=int, default=1, help="Использовать каждый N-й кадр")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Размер батча для инференса")
     parser.add_argument("--device", type=str, default=None, help="Устройство (cpu/cuda)")
