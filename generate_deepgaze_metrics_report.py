@@ -29,6 +29,15 @@ from generate_deepgaze_saliency import (
     load_deepgaze_model,
 )
 from generate_unisal_saliency import read_video_frames, render_heatmap
+from generate_os2d_logo_overlay_video import (
+    DEFAULT_MODEL as OS2D_DEFAULT_MODEL,
+    LogoTemplate,
+    Os2dModelContext,
+    detect_logos_on_frame,
+    draw_detections,
+    load_logo_templates,
+    load_os2d_model,
+)
 
 
 DEFAULT_SECONDS = 5.0
@@ -53,6 +62,17 @@ class FrameSample:
     text_boxes: List[np.ndarray]
     text_overlay_b64: str
     text_energy_ratio: float
+    logo_boxes: List["LogoBoxInfo"]
+    logo_overlay_b64: str
+    logo_energy_ratio: float
+
+
+@dataclass
+class LogoBoxInfo:
+    box: tuple[int, int, int, int]
+    label: str
+    score: float
+    color: tuple[int, int, int]
 
 
 @dataclass
@@ -169,6 +189,30 @@ def compute_text_energy_ratio(prob_map: np.ndarray, boxes: Sequence[np.ndarray])
     return energy_inside / expected_energy
 
 
+def compute_logo_energy_ratio(
+    prob_map: np.ndarray, detections: Sequence[LogoBoxInfo]
+) -> float:
+    if not detections:
+        return 0.0
+
+    mask = np.zeros(prob_map.shape, dtype=np.float32)
+    for detection in detections:
+        x1, y1, x2, y2 = detection.box
+        cv2.rectangle(mask, (x1, y1), (x2, y2), 1.0, thickness=-1)
+
+    energy_inside = float((prob_map * mask).sum())
+    mean_value = float(prob_map.mean())
+    if mean_value <= 1e-12:
+        return 0.0
+    pixels_in_boxes = float(mask.sum())
+    if pixels_in_boxes <= 0:
+        return 0.0
+    expected_energy = mean_value * pixels_in_boxes
+    if expected_energy <= 1e-12:
+        return 0.0
+    return energy_inside / expected_energy
+
+
 def compute_frame_samples(
     predictions: Sequence[DeepGazePrediction],
     *,
@@ -180,10 +224,18 @@ def compute_frame_samples(
     low_text: float = CRAFT_LOW_TEXT,
     canvas_size: int = CRAFT_CANVAS_SIZE,
     mag_ratio: float = CRAFT_MAG_RATIO,
+    logo_context: Os2dModelContext | None = None,
+    logo_templates: Sequence[LogoTemplate] | None = None,
+    logo_score_threshold: float = 0.45,
 ) -> List[FrameSample]:
     samples: List[FrameSample] = []
     use_text_detector = (
         craft_model is not None and craft_utils_module is not None and craft_device is not None
+    )
+    use_logo_detector = (
+        logo_context is not None
+        and logo_templates is not None
+        and len(logo_templates) > 0
     )
     for pred in predictions:
         overlay_full = create_overlay(pred.frame_bgr, pred.prob_map)
@@ -194,6 +246,9 @@ def compute_frame_samples(
         text_boxes: List[np.ndarray] = []
         text_overlay_b64 = overlay_b64
         text_energy_ratio = 0.0
+        logo_boxes: List[LogoBoxInfo] = []
+        logo_overlay_b64 = overlay_b64
+        logo_energy_ratio = 0.0
         if use_text_detector:
             detected_boxes = detect_text_boxes(
                 pred.frame_bgr,
@@ -215,6 +270,31 @@ def compute_frame_samples(
             text_overlay_b64 = encode_image(text_overlay_preview)
             text_energy_ratio = compute_text_energy_ratio(pred.prob_map, text_boxes)
 
+        if use_logo_detector and logo_context is not None and logo_templates is not None:
+            detections = detect_logos_on_frame(
+                pred.frame_bgr,
+                list(logo_templates),
+                logo_context,
+                logo_score_threshold,
+            )
+            if detections:
+                logo_boxes = [
+                    LogoBoxInfo(
+                        box=detection.box,
+                        label=detection.template.display_name,
+                        score=detection.score,
+                        color=detection.template.color,
+                    )
+                    for detection in detections
+                ]
+                overlay_with_logos = draw_detections(overlay_full, detections)
+                logo_overlay_preview = resize_preview(overlay_with_logos)
+                logo_overlay_b64 = encode_image(logo_overlay_preview)
+                logo_energy_ratio = compute_logo_energy_ratio(pred.prob_map, logo_boxes)
+            else:
+                logo_boxes = []
+                logo_energy_ratio = 0.0
+
         samples.append(
             FrameSample(
                 index=pred.frame_index,
@@ -225,6 +305,9 @@ def compute_frame_samples(
                 text_boxes=text_boxes,
                 text_overlay_b64=text_overlay_b64,
                 text_energy_ratio=text_energy_ratio,
+                logo_boxes=logo_boxes,
+                logo_overlay_b64=logo_overlay_b64,
+                logo_energy_ratio=logo_energy_ratio,
             ),
         )
     return samples
@@ -419,6 +502,9 @@ def render_report_html(
     text_frame_overlays = {
         str(sample.index): sample.text_overlay_b64 for sample in frame_samples
     }
+    logo_frame_overlays = {
+        str(sample.index): sample.logo_overlay_b64 for sample in frame_samples
+    }
     pair_diff_images: Dict[str, str] = {}
     pair_distance_images: Dict[str, str] = {}
     for pair in pair_samples:
@@ -428,6 +514,7 @@ def render_report_html(
 
     frame_json = json.dumps(frame_overlays, ensure_ascii=False)
     text_frame_json = json.dumps(text_frame_overlays, ensure_ascii=False)
+    logo_frame_json = json.dumps(logo_frame_overlays, ensure_ascii=False)
     diff_json = json.dumps(pair_diff_images, ensure_ascii=False)
     distance_json = json.dumps(pair_distance_images, ensure_ascii=False)
 
@@ -495,7 +582,19 @@ def render_report_html(
             "AOI-overlap + Text — показывает, насколько энергия внимания в текстовых областях превышает средний уровень кадра.",
             "text",
         ),
+        (
+            "logo_overlap",
+            "AOI-overlap + Logos",
+            "AOI-overlap + Logos — отображает долю внимания, приходящуюся на логотипы брендов относительно среднего уровня кадра.",
+            "logo",
+        ),
     ]
+
+    overlay_sources = {
+        "default": frame_overlays,
+        "text": text_frame_overlays,
+        "logo": logo_frame_overlays,
+    }
 
     single_metrics_html = "".join(
         f"""
@@ -505,7 +604,7 @@ def render_report_html(
                 <div class=\"metric-preview-wrapper\">
                     <div class=\"preview-card\">
                         <h3>{display} · выбранный кадр</h3>
-                        <img id=\"{key}-preview\" src=\"{({'text': text_frame_overlays, 'default': frame_overlays}[source]).get(initial_frame_key, '')}\" alt=\"{display} overlay\" />
+                        <img id=\"{key}-preview\" src=\"{overlay_sources.get(source, frame_overlays).get(initial_frame_key, '')}\" alt=\"{display} overlay\" />
                         <div class=\"caption\" id=\"{key}-caption\">{format_frame_caption(display, initial_frame_key)}</div>
                     </div>
                 </div>
@@ -744,6 +843,7 @@ def render_report_html(
     <script>
         const frameOverlays = {frame_json};
         const textFrameOverlays = {text_frame_json};
+        const logoFrameOverlays = {logo_frame_json};
         const pairDiffImages = {diff_json};
         const pairDistanceImages = {distance_json};
 
@@ -753,6 +853,7 @@ def render_report_html(
             {{ figureId: 'fig-conc10', imgId: 'conc10-preview', captionId: 'conc10-caption', label: 'Concentration 10%', source: 'default' }},
             {{ figureId: 'fig-conc20', imgId: 'conc20-preview', captionId: 'conc20-caption', label: 'Concentration 20%', source: 'default' }},
             {{ figureId: 'fig-text-overlap', imgId: 'text_overlap-preview', captionId: 'text_overlap-caption', label: 'AOI-overlap + Text', source: 'text' }},
+            {{ figureId: 'fig-logo-overlap', imgId: 'logo_overlap-preview', captionId: 'logo_overlap-caption', label: 'AOI-overlap + Logos', source: 'logo' }},
         ];
 
         const pairMetricConfigs = [
@@ -809,7 +910,12 @@ def render_report_html(
 
         function updateSingleMetricPreview(config, frameIndex) {{
             const key = String(frameIndex);
-            const sourceMap = config.source === 'text' ? textFrameOverlays : frameOverlays;
+            let sourceMap = frameOverlays;
+            if (config.source === 'text') {{
+                sourceMap = textFrameOverlays;
+            }} else if (config.source === 'logo') {{
+                sourceMap = logoFrameOverlays;
+            }}
             const overlay = sourceMap[key];
             if (!overlay) return;
             const img = document.getElementById(config.imgId);
@@ -915,6 +1021,7 @@ def compute_figures(frame_samples: Sequence[FrameSample], pair_samples: Sequence
     conc10_values = [float(compute_concentration(sample.prob_map, 0.10)) for sample in frame_samples]
     conc20_values = [float(compute_concentration(sample.prob_map, 0.20)) for sample in frame_samples]
     text_overlap_values = [float(sample.text_energy_ratio) for sample in frame_samples]
+    logo_overlap_values = [float(sample.logo_energy_ratio) for sample in frame_samples]
 
     figures: Dict[str, go.Figure] = {}
     figures['mean'] = build_single_frame_figure(
@@ -956,6 +1063,14 @@ def compute_figures(frame_samples: Sequence[FrameSample], pair_samples: Sequence
         value_label="Отн. энергия текста",
         indices=frame_indices,
         color="#d97706",
+    )
+    figures['logo_overlap'] = build_single_frame_figure(
+        title="AOI-overlap + Logos — относительная энергия на логотипах",
+        x=frame_numbers,
+        values=logo_overlap_values,
+        value_label="Отн. энергия логотипов",
+        indices=frame_indices,
+        color="#0ea5e9",
     )
 
     if pair_samples:
@@ -1028,6 +1143,9 @@ def process_video(
     low_text: float,
     canvas_size: int,
     mag_ratio: float,
+    logos_dir: Path | None,
+    os2d_context: Os2dModelContext | None,
+    logo_score_threshold: float,
 ) -> None:
     frames_info = read_video_frames(video_path, seconds, frame_skip)
     height, width = frames_info.frame_size
@@ -1043,6 +1161,13 @@ def process_video(
         ),
     )
 
+    logo_templates: Sequence[LogoTemplate] | None = None
+    if os2d_context is not None and logos_dir is not None:
+        try:
+            logo_templates = load_logo_templates(video_path, logos_dir, os2d_context)
+        except FileNotFoundError:
+            logo_templates = []
+
     frame_samples = compute_frame_samples(
         predictions,
         craft_model=craft_model,
@@ -1053,6 +1178,9 @@ def process_video(
         low_text=low_text,
         canvas_size=canvas_size,
         mag_ratio=mag_ratio,
+        logo_context=os2d_context,
+        logo_templates=logo_templates,
+        logo_score_threshold=logo_score_threshold,
     )
     pair_samples = compute_pair_samples(frame_samples)
     figures_html = compute_figures(frame_samples, pair_samples)
@@ -1089,6 +1217,43 @@ def main() -> int:
     parser.add_argument("--frame-skip", type=int, default=1, help="Использовать каждый N-й кадр")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Размер батча для инференса")
     parser.add_argument("--device", type=str, default=None, help="Устройство (cpu/cuda)")
+    parser.add_argument("--logos-dir", type=Path, default=Path("data/logos"), help="Каталог с логотипами")
+    parser.add_argument(
+        "--logo-model",
+        type=str,
+        default=OS2D_DEFAULT_MODEL,
+        help="Весы модели OS2D для поиска логотипов",
+    )
+    parser.add_argument(
+        "--logo-frame-size",
+        type=int,
+        default=1500,
+        help="Целевая длина большей стороны кадра перед подачей в OS2D",
+    )
+    parser.add_argument(
+        "--logo-nms-iou",
+        type=float,
+        default=0.3,
+        help="Порог IoU для NMS в OS2D",
+    )
+    parser.add_argument(
+        "--logo-nms-score",
+        type=float,
+        default=float("-inf"),
+        help="Порог уверенности перед NMS в OS2D",
+    )
+    parser.add_argument(
+        "--logo-max-detections",
+        type=int,
+        default=30,
+        help="Максимальное число детекций логотипов на кадр",
+    )
+    parser.add_argument(
+        "--logo-score-threshold",
+        type=float,
+        default=0.45,
+        help="Порог уверенности для учёта логотипов",
+    )
     args = parser.parse_args()
 
     if args.video is not None and not args.video.exists():
@@ -1101,6 +1266,14 @@ def main() -> int:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     model = load_deepgaze_model(repo_dir, "deepgaze2e", device)
     craft_model, craft_utils_module = load_craft_model(device)
+    os2d_context = load_os2d_model(
+        model_name=args.logo_model,
+        device=device,
+        frame_target_size=args.logo_frame_size,
+        nms_iou_threshold=args.logo_nms_iou,
+        nms_score_threshold=args.logo_nms_score,
+        max_detections=args.logo_max_detections,
+    )
 
     if args.video is not None:
         videos = [args.video.resolve()]
@@ -1129,6 +1302,9 @@ def main() -> int:
             low_text=CRAFT_LOW_TEXT,
             canvas_size=CRAFT_CANVAS_SIZE,
             mag_ratio=CRAFT_MAG_RATIO,
+            logos_dir=args.logos_dir.resolve(),
+            os2d_context=os2d_context,
+            logo_score_threshold=args.logo_score_threshold,
         )
 
     return 0
