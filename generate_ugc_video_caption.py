@@ -3,7 +3,7 @@
 Generate rich captions for short videos using the openinterx/UGC-VideoCaptioner model.
 
 The script performs the following steps:
-1. Installs required dependencies (torch, transformers, decord, soundfile, qwen_omni_utils).
+1. Installs required dependencies (torch, transformers, soundfile, qwen_omni_utils).
 2. Loads the UGC-VideoCaptioner (Qwen2.5 Omni 3B) model with automatic device placement.
 3. Sends the video and a structured marketing-oriented prompt to the model.
 4. Prints the generated caption describing storyline, perceived advertising intent, and sentiment cues.
@@ -14,6 +14,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -23,7 +24,6 @@ from typing import List
 REQUIRED_PACKAGES: List[str] = [
     "torch",  # core tensor library with CUDA support when available
     "transformers",  # model and processor
-    "decord",  # video decoding backend expected by the processor
     "soundfile",  # optional audio output dependency from reference code
     "qwen_omni_utils",  # utilities for multimodal input formatting
 ]
@@ -35,33 +35,7 @@ def install_dependencies() -> None:
 
     for package in REQUIRED_PACKAGES:
         command = [sys.executable, "-m", "pip", "install", "-U", package]
-        try:
-            subprocess.check_call(command)
-        except subprocess.CalledProcessError:
-            # decord does not publish wheels for some platforms (e.g., macOS arm64).
-            # Try a source install fallback (note the python submodule) and surface a clearer
-            # error if it fails.
-            if package == "decord":
-                fallback_cmd = [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "-U",
-                    "decord@git+https://github.com/dmlc/decord.git#subdirectory=python",
-                ]
-                print(
-                    "[setup] decord wheel not available; attempting source install from GitHub..."
-                )
-                try:
-                    subprocess.check_call(fallback_cmd)
-                    continue
-                except subprocess.CalledProcessError as err:
-                    raise SystemExit(
-                        "Failed to install decord. On macOS, ensure Xcode command-line tools "
-                        "are installed and try 'brew install cmake ffmpeg'."
-                    ) from err
-            raise
+        subprocess.check_call(command)
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +81,8 @@ def build_prompt() -> str:
 
 def main() -> None:
     args = parse_args()
+    # Prefer torchvision for video decoding to avoid decord build issues on macOS.
+    os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchvision")
     install_dependencies()
 
     # Imports after dependency installation
