@@ -31,23 +31,44 @@ REQUIRED_PACKAGES: List[str] = [
 
 def install_dependencies() -> None:
     """Install missing Python dependencies via pip in the current environment."""
-    command = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "-U",
-        *REQUIRED_PACKAGES,
-    ]
     print("[setup] Installing/updating dependencies: " + " ".join(REQUIRED_PACKAGES))
-    subprocess.check_call(command)
+
+    for package in REQUIRED_PACKAGES:
+        command = [sys.executable, "-m", "pip", "install", "-U", package]
+        try:
+            subprocess.check_call(command)
+        except subprocess.CalledProcessError:
+            # decord does not publish wheels for some platforms (e.g., macOS arm64).
+            # Try a source install fallback and surface a clearer error if it fails.
+            if package == "decord":
+                fallback_cmd = [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "-U",
+                    "decord@git+https://github.com/dmlc/decord.git",
+                ]
+                print(
+                    "[setup] decord wheel not available; attempting source install from GitHub..."
+                )
+                try:
+                    subprocess.check_call(fallback_cmd)
+                    continue
+                except subprocess.CalledProcessError as err:
+                    raise SystemExit(
+                        "Failed to install decord. On macOS, ensure Xcode command-line tools "
+                        "are installed and try 'brew install cmake ffmpeg'."
+                    ) from err
+            raise
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate marketing-aware captions for a short video.")
     parser.add_argument(
         "--video",
-        required=True,
+        required=False,
+        default=Path("data/videos/000-youtube.mp4"),
         type=Path,
         help="Path to the video file (recommend <= ~1 minute, GPU ~24GB).",
     )
