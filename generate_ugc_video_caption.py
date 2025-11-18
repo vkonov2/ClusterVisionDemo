@@ -18,24 +18,45 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
+from typing import Iterable, List
 
 
 REQUIRED_PACKAGES: List[str] = [
     "torch",  # core tensor library with CUDA support when available
     "transformers",  # model and processor
     "soundfile",  # optional audio output dependency from reference code
+    "imageio[ffmpeg]",  # lightweight video decoding to avoid backend segfaults
     "qwen_omni_utils",  # utilities for multimodal input formatting
 ]
 
 
-def install_dependencies() -> None:
-    """Install missing Python dependencies via pip in the current environment."""
-    print("[setup] Installing/updating dependencies: " + " ".join(REQUIRED_PACKAGES))
+def _is_installed(package: str) -> bool:
+    """Heuristically check whether a package/module can be imported."""
 
-    for package in REQUIRED_PACKAGES:
-        command = [sys.executable, "-m", "pip", "install", "-U", package]
-        subprocess.check_call(command)
+    import importlib.util
+
+    name = package.split("[")[0].split("==")[0].replace("-", "_")
+    return importlib.util.find_spec(name) is not None
+
+
+def _install_packages(packages: Iterable[str]) -> None:
+    env = dict(os.environ)
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    for package in packages:
+        command = [sys.executable, "-m", "pip", "install", "-U", "--quiet", package]
+        subprocess.check_call(command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, env=env)
+
+
+def install_dependencies() -> None:
+    """Install only the missing Python dependencies via pip in the current environment."""
+
+    missing = [pkg for pkg in REQUIRED_PACKAGES if not _is_installed(pkg)]
+    if not missing:
+        print("[setup] Dependencies already installed; skipping pip installs.")
+        return
+
+    print("[setup] Installing missing dependencies: " + " ".join(missing))
+    _install_packages(missing)
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,21 +100,49 @@ def build_prompt() -> str:
     )
 
 
+def load_video_frames(video_path: Path, target_fps: float = 2.0, max_frames: int = 256) -> List["Image.Image"]:
+    """Decode a video into RGB frames using imageio with simple downsampling."""
+
+    import imageio.v2 as imageio
+    from PIL import Image
+
+    reader = imageio.get_reader(str(video_path))
+    meta = reader.get_meta_data()
+    native_fps = float(meta.get("fps", target_fps) or target_fps)
+    fps = target_fps if native_fps <= 0 else native_fps
+    step = max(int(round(fps / target_fps)), 1)
+
+    frames: List[Image.Image] = []
+    for idx, frame in enumerate(reader):
+        if idx % step != 0:
+            continue
+        frames.append(Image.fromarray(frame).convert("RGB"))
+        if len(frames) >= max_frames:
+            break
+    reader.close()
+
+    if not frames:
+        raise ValueError(f"No frames could be read from video: {video_path}")
+    return frames
+
+
 def main() -> None:
     args = parse_args()
-    # Prefer torchvision for video decoding to avoid decord build issues on macOS.
-    os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchvision")
     install_dependencies()
 
     # Imports after dependency installation
     import torch
     from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
     from qwen_omni_utils import process_mm_info
+    from PIL import Image
 
     if not args.video.exists():
         raise FileNotFoundError(f"Video file not found: {args.video}")
 
     prompt_text = build_prompt()
+
+    print("[prepare] Decoding video frames with imageio to avoid native backend issues...")
+    frames: List[Image.Image] = load_video_frames(args.video)
 
     print("[load] Loading model and processor (may take a while on first run)...")
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
@@ -107,13 +156,14 @@ def main() -> None:
         {
             "role": "user",
             "content": [
-                {"type": "video", "video": str(args.video)},
+                {"type": "video", "video": frames, "fps": 2.0},
+                {"type": "audio", "audio": str(args.video)},
                 {"type": "text", "text": prompt_text},
             ],
         }
     ]
 
-    use_audio_in_video = True
+    use_audio_in_video = False
 
     text_prompt = processor.apply_chat_template(
         conversation, add_generation_prompt=True, tokenize=False
