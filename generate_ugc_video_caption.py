@@ -39,7 +39,8 @@ def install_dependencies() -> None:
             subprocess.check_call(command)
         except subprocess.CalledProcessError:
             # decord does not publish wheels for some platforms (e.g., macOS arm64).
-            # Try a source install fallback and surface a clearer error if it fails.
+            # Try a source install fallback (note the python submodule) and surface a clearer
+            # error if it fails.
             if package == "decord":
                 fallback_cmd = [
                     sys.executable,
@@ -47,7 +48,7 @@ def install_dependencies() -> None:
                     "pip",
                     "install",
                     "-U",
-                    "decord@git+https://github.com/dmlc/decord.git",
+                    "decord@git+https://github.com/dmlc/decord.git#subdirectory=python",
                 ]
                 print(
                     "[setup] decord wheel not available; attempting source install from GitHub..."
