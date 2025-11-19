@@ -35,7 +35,7 @@ LOW_TEXT = 0.4
 CANVAS_SIZE = 1280
 MAG_RATIO = 1.5
 LOGO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
-DEFAULT_LOGO_SCORE_THRESHOLD = 0.45
+LOGO_SCORE_THRESHOLD = 0.45
 
 
 @dataclass
@@ -308,34 +308,25 @@ def load_logo_templates_from_path(
     if logo_path is None:
         return []
 
-    candidates: list[Path] = []
     if logo_path.is_dir():
-        for entry in sorted(logo_path.iterdir()):
-            if entry.suffix.lower() in LOGO_EXTENSIONS:
-                candidates.append(entry)
-    elif logo_path.suffix.lower() in LOGO_EXTENSIONS:
-        candidates.append(logo_path)
-    else:
-        raise ValueError("Unsupported logo format. Provide an image or folder with images.")
+        raise ValueError("Logo path must be an image file, not a directory.")
+    if logo_path.suffix.lower() not in LOGO_EXTENSIONS:
+        raise ValueError("Unsupported logo format. Provide an image file (png/jpg/etc.)")
 
-    templates: list[LogoTemplate] = []
-    for candidate in candidates:
-        with Image.open(candidate) as img:
-            tensor = preprocess_logo_image(
-                img.convert("RGB"),
-                context.transform_image,
-                context.class_image_size,
-                context.device,
-            )
-        templates.append(LogoTemplate(name=candidate.stem, tensor=tensor, path=candidate))
-    return templates
+    with Image.open(logo_path) as img:
+        tensor = preprocess_logo_image(
+            img.convert("RGB"),
+            context.transform_image,
+            context.class_image_size,
+            context.device,
+        )
+    return [LogoTemplate(name=logo_path.stem, tensor=tensor, path=logo_path)]
 
 
 def detect_logos_on_frame(
     frame_bgr: np.ndarray,
     templates: list[LogoTemplate],
     context: Os2dModelContext,
-    score_threshold: float,
 ) -> list[LogoDetection]:
     if not templates:
         return []
@@ -383,7 +374,7 @@ def detect_logos_on_frame(
 
     detections: list[LogoDetection] = []
     for score, label, (x1, y1, x2, y2) in zip(scores, labels, coords):
-        if score < score_threshold or label >= len(templates):
+        if score < LOGO_SCORE_THRESHOLD or label >= len(templates):
             continue
 
         x1 = int(round(x1 * scale_x))
@@ -493,7 +484,6 @@ def process_video(
     frame_skip: int,
     chunk_size: int,
     device: torch.device,
-    logo_score_threshold: float,
     output_path: Path,
 ) -> dict[str, Any]:
     """Processes a video, runs all detectors per frame, and exports analytics to JSON."""
@@ -533,12 +523,7 @@ def process_video(
                 CANVAS_SIZE,
                 MAG_RATIO,
             )
-            logo_detections = detect_logos_on_frame(
-                frame_bgr,
-                logo_templates,
-                os2d_ctx,
-                logo_score_threshold,
-            )
+            logo_detections = detect_logos_on_frame(frame_bgr, logo_templates, os2d_ctx)
 
             mean_value = float(prob_map.mean())
             peak_value = float(prob_map.max())
@@ -612,12 +597,6 @@ def main() -> int:
     parser.add_argument("--frame-skip", type=int, default=1, help="Использовать каждый N-й кадр")
     parser.add_argument("--chunk-size", type=int, default=8, help="Размер батча для инференса")
     parser.add_argument("--device", type=str, default=None, help="Устройство (cpu/cuda)")
-    parser.add_argument(
-        "--logo-score-threshold",
-        type=float,
-        default=DEFAULT_LOGO_SCORE_THRESHOLD,
-        help="Минимальный скор OS2D для учёта логотипа",
-    )
     args = parser.parse_args()
 
     if args.video is not None and not args.video.exists():
@@ -637,7 +616,6 @@ def main() -> int:
         frame_skip=args.frame_skip,
         chunk_size=args.chunk_size,
         device=device,
-        logo_score_threshold=args.logo_score_threshold,
         output_path=args.output,
     )
 
