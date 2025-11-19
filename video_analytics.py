@@ -2,6 +2,10 @@
 """Покадровая аналитика внимания, текста и логотипов для коротких видео."""
 from __future__ import annotations
 
+import faulthandler
+
+faulthandler.enable()
+
 import argparse
 import json
 import sys
@@ -12,8 +16,64 @@ from typing import Any, List, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
-import torchvision.transforms as T
+import torch.functional as F
 from PIL import Image
+from tqdm import tqdm
+
+# Ensure torch.meshgrid uses explicit indexing to avoid deprecation warnings.
+if not getattr(torch, "_meshgrid_default_indexing_set", False):
+    _original_meshgrid = torch.meshgrid
+
+    def _meshgrid_with_default_indexing(*tensors, **kwargs):
+        if "indexing" not in kwargs:
+            kwargs["indexing"] = "ij"
+        return _original_meshgrid(*tensors, **kwargs)
+
+    torch.meshgrid = _meshgrid_with_default_indexing  # type: ignore[assignment]
+    F.meshgrid = _meshgrid_with_default_indexing  # type: ignore[assignment]
+    setattr(torch, "_meshgrid_default_indexing_set", True)
+
+
+# --- мини-замена torchvision.transforms -------------------
+class ToTensor:
+    def __call__(self, img: Image.Image) -> torch.Tensor:
+        arr = np.array(img, copy=True)
+        if arr.ndim == 2:
+            arr = arr[:, :, None]
+        # HWC -> CHW, float32 [0,1]
+        arr = torch.from_numpy(arr.transpose(2, 0, 1)).float().div(255.0)
+        return arr
+
+
+class Normalize:
+    def __init__(self, mean, std):
+        # mean, std: последовательности длины C
+        self.mean = torch.tensor(mean, dtype=torch.float32)[:, None, None]
+        self.std = torch.tensor(std, dtype=torch.float32)[:, None, None]
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+
+class Compose:
+    def __init__(self, transforms):
+        self.transforms = list(transforms)
+
+    def __call__(self, x):
+        for t in self.transforms:
+            x = t(x)
+        return x
+
+
+class _T:
+    Compose = Compose
+    ToTensor = ToTensor
+    Normalize = Normalize
+
+
+T = _T()
+# --- конец мини-замены ------------------------------------
+
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "models"
@@ -57,7 +117,7 @@ class Os2dModelContext:
 
     net: Any
     box_coder: Any
-    transform_image: T.Compose
+    transform_image: Compose
     device: torch.device
     frame_target_size: int
     class_image_size: int
@@ -283,11 +343,11 @@ def detect_text_boxes(
 
 def preprocess_logo_image(
     image: Image.Image,
-    transform: T.Compose,
+    transform: Compose,
     target_size: int,
     device: torch.device,
 ) -> torch.Tensor:
-    from os2d.utils import get_image_size_after_resize_preserving_aspect_ratio  # type: ignore
+    from os2d.os2d.utils import get_image_size_after_resize_preserving_aspect_ratio  # type: ignore
 
     height, width = image.size[1], image.size[0]
     new_height, new_width = get_image_size_after_resize_preserving_aspect_ratio(
@@ -499,8 +559,10 @@ def process_video(
 
     per_frame: list[dict[str, Any]] = []
     chunk = max(1, chunk_size)
+    total_frames = len(frames_info.frames_bgr)
+    progress = tqdm(total=total_frames, desc="Processing frames", unit="frame")
 
-    for start in range(0, len(frames_info.frames_bgr), chunk):
+    for start in range(0, total_frames, chunk):
         batch_frames = frames_info.frames_bgr[start : start + chunk]
         tensors = [frame_to_tensor(frame) for frame in batch_frames]
         images = torch.stack(tensors).to(device)
@@ -549,6 +611,9 @@ def process_video(
                     "logos": serialize_logo_detections(logo_detections),
                 }
             )
+        progress.update(len(batch_frames))
+
+    progress.close()
 
     metric_keys = [
         "mean",
@@ -592,8 +657,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Получение аналитики по видео")
     parser.add_argument("--video", type=Path, default=None, help="Путь к видео")
     parser.add_argument("--logo", type=Path, default=None, help="Путь к логотипу")
-    parser.add_argument("--output", type=Path, default=Path("analytics.json"), help="Путь к JSON-отчёту")
-    parser.add_argument("--seconds", type=float, default=None, help="Длительность анализируемого фрагмента (по умолчанию весь ролик)")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("analytics.json"),
+        help="Путь к JSON-отчёту",
+    )
+    parser.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="Длительность анализируемого фрагмента (по умолчанию весь ролик)",
+    )
     parser.add_argument("--frame-skip", type=int, default=1, help="Использовать каждый N-й кадр")
     parser.add_argument("--chunk-size", type=int, default=8, help="Размер батча для инференса")
     parser.add_argument("--device", type=str, default=None, help="Устройство (cpu/cuda)")
