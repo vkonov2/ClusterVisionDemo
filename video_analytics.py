@@ -558,7 +558,16 @@ def process_video(
     logo_templates = load_logo_templates_from_path(logo_path, os2d_ctx)
 
     per_frame: list[dict[str, Any]] = []
+    volatility_pairs: list[dict[str, Any]] = []
     chunk = max(1, chunk_size)
+    diagonal = float(np.hypot(height, width))
+    if diagonal <= 0:
+        diagonal = 1.0
+
+    prev_prob_map: np.ndarray | None = None
+    prev_max_position: tuple[int, int] | None = None
+    prev_frame_index: int | None = None
+    prev_timestamp: float | None = None
     total_frames = len(frames_info.frames_bgr)
     progress = tqdm(total=total_frames, desc="Processing frames", unit="frame")
 
@@ -611,6 +620,36 @@ def process_video(
                     "logos": serialize_logo_detections(logo_detections),
                 }
             )
+
+            if prev_prob_map is not None and prev_max_position is not None and prev_frame_index is not None:
+                diff_map = prob_map - prev_prob_map
+                vol1_mean = float(np.mean(np.abs(diff_map)))
+                vol1_rms = float(np.sqrt(np.mean(np.square(diff_map))))
+                vol1_max = float(np.max(np.abs(diff_map)))
+
+                prev_pos = np.array(prev_max_position, dtype=np.float32)
+                curr_pos = np.array(max_position, dtype=np.float32)
+                dist_px = float(np.linalg.norm(curr_pos - prev_pos))
+                dist_norm = float(dist_px / diagonal)
+
+                volatility_pairs.append(
+                    {
+                        "frame_a": prev_frame_index,
+                        "frame_b": frame_index,
+                        "time_a": prev_timestamp,
+                        "time_b": timestamp,
+                        "vol1_mean": vol1_mean,
+                        "vol1_rms": vol1_rms,
+                        "vol1_max": vol1_max,
+                        "vol2_value": dist_px,
+                        "vol2_normalized": dist_norm,
+                    }
+                )
+
+            prev_prob_map = prob_map
+            prev_max_position = max_position
+            prev_frame_index = frame_index
+            prev_timestamp = timestamp
         progress.update(len(batch_frames))
 
     progress.close()
@@ -634,6 +673,33 @@ def process_video(
         ]
         for key in metric_keys
     }
+
+    def build_volatility_series(field: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "frame_a": pair["frame_a"],
+                "frame_b": pair["frame_b"],
+                "time_a": pair["time_a"],
+                "time_b": pair["time_b"],
+                "value": pair[field],
+            }
+            for pair in volatility_pairs
+        ]
+
+    series["volatility1_mean"] = build_volatility_series("vol1_mean")
+    series["volatility1_rms"] = build_volatility_series("vol1_rms")
+    series["volatility1_max"] = build_volatility_series("vol1_max")
+    series["volatility2"] = [
+        {
+            "frame_a": pair["frame_a"],
+            "frame_b": pair["frame_b"],
+            "time_a": pair["time_a"],
+            "time_b": pair["time_b"],
+            "value": pair["vol2_value"],
+            "normalized": pair["vol2_normalized"],
+        }
+        for pair in volatility_pairs
+    ]
 
     analytics = {
         "video": str(video_path) if video_path is not None else None,
