@@ -135,6 +135,7 @@ def main() -> None:
     from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
     from qwen_omni_utils import process_mm_info
     from PIL import Image
+    import soundfile as sf
 
     if not args.video.exists():
         raise FileNotFoundError(f"Video file not found: {args.video}")
@@ -147,8 +148,8 @@ def main() -> None:
     print("[load] Loading model and processor (may take a while on first run)...")
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         "openinterx/UGC-VideoCaptioner",
-        torch_dtype="auto",
-        device_map="auto",
+        dtype="auto",
+        device_map={"": "cpu"},
     )
     processor = Qwen2_5OmniProcessor.from_pretrained("openinterx/UGC-VideoCaptioner")
 
@@ -183,7 +184,7 @@ def main() -> None:
     inputs = inputs.to(model.device).to(model.dtype)
 
     print("[infer] Generating caption...")
-    generated_tokens = model.generate(
+    generated_tokens, audio = model.generate(
         **inputs,
         use_audio_in_video=use_audio_in_video,
         max_new_tokens=args.max_new_tokens,
@@ -191,6 +192,13 @@ def main() -> None:
         temperature=args.temperature,
         top_p=args.top_p,
     )
+
+    if audio is not None:
+        audio_path = Path("data/audios/010-30.wav")
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        audio_waveform = audio.reshape(-1).detach().cpu().numpy()
+        sf.write(audio_path, audio_waveform, samplerate=24000)
+        print(f"[audio] Saved synthesized narration to {audio_path}")
 
     captions = processor.batch_decode(
         generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
