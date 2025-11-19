@@ -14,9 +14,11 @@ Example:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 from typing import Iterable, List
 
@@ -39,15 +41,22 @@ def _is_installed(package: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
-def _install_packages(packages: Iterable[str]) -> None:
+async def _install_package(package: str) -> None:
     env = dict(os.environ)
     env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-    for package in packages:
-        command = [sys.executable, "-m", "pip", "install", "-U", "--quiet", package]
-        subprocess.check_call(command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, env=env)
+    command = [sys.executable, "-m", "pip", "install", "-U", "--quiet", package]
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+    )
+    returncode = await process.wait()
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, command)
 
 
-def install_dependencies() -> None:
+async def install_dependencies() -> None:
     """Install only the missing Python dependencies via pip in the current environment."""
 
     missing = [pkg for pkg in REQUIRED_PACKAGES if not _is_installed(pkg)]
@@ -56,7 +65,8 @@ def install_dependencies() -> None:
         return
 
     print("[setup] Installing missing dependencies: " + " ".join(missing))
-    _install_packages(missing)
+    for package in missing:
+        await _install_package(package)
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,12 +136,16 @@ def load_video_frames(video_path: Path, target_fps: float = 2.0, max_frames: int
     return frames
 
 
-def main() -> None:
+async def load_video_frames_async(video_path: Path) -> List["Image.Image"]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(load_video_frames, video_path))
+
+
+async def async_main() -> None:
     args = parse_args()
-    install_dependencies()
+    await install_dependencies()
 
     # Imports after dependency installation
-    import torch
     from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
     from qwen_omni_utils import process_mm_info
     from PIL import Image
@@ -143,15 +157,23 @@ def main() -> None:
     prompt_text = build_prompt()
 
     print("[prepare] Decoding video frames with imageio to avoid native backend issues...")
-    frames: List[Image.Image] = load_video_frames(args.video)
+    frames: List[Image.Image] = await load_video_frames_async(args.video)
 
     print("[load] Loading model and processor (may take a while on first run)...")
-    model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-        "openinterx/UGC-VideoCaptioner",
-        dtype="auto",
-        device_map={"": "cpu"},
-    )
-    processor = Qwen2_5OmniProcessor.from_pretrained("openinterx/UGC-VideoCaptioner")
+
+    async def _load_model_and_processor():
+        def _load():
+            model_local = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+                "openinterx/UGC-VideoCaptioner",
+                dtype="auto",
+                device_map={"": "cpu"},
+            )
+            processor_local = Qwen2_5OmniProcessor.from_pretrained("openinterx/UGC-VideoCaptioner")
+            return model_local, processor_local
+
+        return await asyncio.to_thread(_load)
+
+    model, processor = await _load_model_and_processor()
 
     conversation = [
         {
@@ -184,20 +206,31 @@ def main() -> None:
     inputs = inputs.to(model.device).to(model.dtype)
 
     print("[infer] Generating caption...")
-    generated_tokens, audio = model.generate(
-        **inputs,
-        use_audio_in_video=use_audio_in_video,
-        max_new_tokens=args.max_new_tokens,
-        do_sample=True,
-        temperature=args.temperature,
-        top_p=args.top_p,
-    )
+
+    async def _generate():
+        def _run():
+            return model.generate(
+                **inputs,
+                use_audio_in_video=use_audio_in_video,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=True,
+                temperature=args.temperature,
+                top_p=args.top_p,
+            )
+
+        return await asyncio.to_thread(_run)
+
+    generated_tokens, audio = await _generate()
 
     if audio is not None:
         audio_path = Path("data/audios/010-30.wav")
         audio_path.parent.mkdir(parents=True, exist_ok=True)
         audio_waveform = audio.reshape(-1).detach().cpu().numpy()
-        sf.write(audio_path, audio_waveform, samplerate=24000)
+
+        def _write_audio() -> None:
+            sf.write(audio_path, audio_waveform, samplerate=24000)
+
+        await asyncio.to_thread(_write_audio)
         print(f"[audio] Saved synthesized narration to {audio_path}")
 
     captions = processor.batch_decode(
@@ -210,4 +243,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())

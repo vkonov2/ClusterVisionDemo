@@ -7,6 +7,7 @@ import faulthandler
 faulthandler.enable()
 
 import argparse
+import asyncio
 import json
 import sys
 from dataclasses import dataclass
@@ -534,7 +535,7 @@ def serialize_logo_detections(detections: Sequence[LogoDetection]) -> list[dict[
     ]
 
 
-def process_video(
+async def process_video(
     video_path: Path | None,
     logo_path: Path | None,
     deepgaze_model: DeepGazeIIE,
@@ -548,14 +549,14 @@ def process_video(
 ) -> dict[str, Any]:
     """Processes a video, runs all detectors per frame, and exports analytics to JSON."""
 
-    frames_info = read_video_frames(video_path, seconds, frame_skip)
+    frames_info = await asyncio.to_thread(read_video_frames, video_path, seconds, frame_skip)
     height, width = frames_info.frame_size
 
     centerbias_template = np.load(DEEPGAZE_DIR / "centerbias_mit1003.npy")
     centerbias_log = build_centerbias(height, width, uniform=False, template=centerbias_template)
     centerbias_tensor = torch.from_numpy(centerbias_log).float().to(device)
 
-    logo_templates = load_logo_templates_from_path(logo_path, os2d_ctx)
+    logo_templates = await asyncio.to_thread(load_logo_templates_from_path, logo_path, os2d_ctx)
 
     per_frame: list[dict[str, Any]] = []
     volatility_pairs: list[dict[str, Any]] = []
@@ -584,7 +585,8 @@ def process_video(
         for offset, frame_bgr in enumerate(batch_frames):
             frame_index = start + offset
             prob_map = log_density_to_prob(prob_maps[offset])
-            text_boxes = detect_text_boxes(
+            text_boxes = await asyncio.to_thread(
+                detect_text_boxes,
                 frame_bgr,
                 craft_model,
                 device,
@@ -594,7 +596,12 @@ def process_video(
                 CANVAS_SIZE,
                 MAG_RATIO,
             )
-            logo_detections = detect_logos_on_frame(frame_bgr, logo_templates, os2d_ctx)
+            logo_detections = await asyncio.to_thread(
+                detect_logos_on_frame,
+                frame_bgr,
+                logo_templates,
+                os2d_ctx,
+            )
 
             mean_value = float(prob_map.mean())
             peak_value = float(prob_map.max())
@@ -719,7 +726,7 @@ def process_video(
     return analytics
 
 
-def main() -> int:
+async def async_main() -> int:
     parser = argparse.ArgumentParser(description="Получение аналитики по видео")
     parser.add_argument("--video", type=Path, default=None, help="Путь к видео")
     parser.add_argument("--logo", type=Path, default=None, help="Путь к логотипу")
@@ -747,7 +754,7 @@ def main() -> int:
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     deepgaze_model, craft_model, os2d_ctx = load_models(device)
-    process_video(
+    await process_video(
         video_path=args.video,
         logo_path=args.logo,
         deepgaze_model=deepgaze_model,
@@ -764,4 +771,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(async_main()))
