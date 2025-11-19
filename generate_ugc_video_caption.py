@@ -14,11 +14,9 @@ Example:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import os
 import subprocess
 import sys
-from functools import partial
 from pathlib import Path
 from typing import Iterable, List
 
@@ -41,22 +39,7 @@ def _is_installed(package: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
-async def _install_package(package: str) -> None:
-    env = dict(os.environ)
-    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-    command = [sys.executable, "-m", "pip", "install", "-U", "--quiet", package]
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.STDOUT,
-        env=env,
-    )
-    returncode = await process.wait()
-    if returncode != 0:
-        raise subprocess.CalledProcessError(returncode, command)
-
-
-async def install_dependencies() -> None:
+def install_dependencies() -> None:
     """Install only the missing Python dependencies via pip in the current environment."""
 
     missing = [pkg for pkg in REQUIRED_PACKAGES if not _is_installed(pkg)]
@@ -65,8 +48,11 @@ async def install_dependencies() -> None:
         return
 
     print("[setup] Installing missing dependencies: " + " ".join(missing))
+    env = dict(os.environ)
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
     for package in missing:
-        await _install_package(package)
+        command = [sys.executable, "-m", "pip", "install", "-U", "--quiet", package]
+        subprocess.check_call(command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, env=env)
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,14 +86,22 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_prompt() -> str:
-    """Create a structured prompt targeting storyline, audience view, and sentiment."""
-    return (
-        "You will watch a short-form UGC video with audio. Provide a concise yet rich description that covers: "
-        "(1) Storyline — what happens, the setting, key people/objects, and their actions; "
-        "(2) Audience perception — how the target viewer would interpret the clip and what product/service or brand is being hinted or promoted; "
-        "(3) Emotion — the emotional tone or sentiment conveyed by visuals and audio. "
-        "Write in a natural paragraph (no bullet points) that fuses visual and audio cues."
+    lines = (
+        "You are a video-to-text transcription model. Describe the video with maximal detail and complete neutrality.",
+        "Do NOT infer or guess intent, emotions, or target audience — only describe what is observable.",
+        "Your output must follow this structure:",
+        "1. Characters and Demographics: Number of people, their approximate age range, gender presentation, clothing style, notable visual traits. Social context indicators (e.g., family, professionals, students).",
+        "2. Setting and Environment: Indoor/outdoor location, style of interior or environment, objects present, socioeconomic cues.",
+        "3. Narrative Summary: Step-by-step description of what happens in the video. Include actions, transitions, scene changes, product usage, interactions.",
+        "4. Product and Branding: What product or service appears. How it is visually shown: packaging, logos, close-ups, usage demonstrations.",
+        "5. Text and Speech: All spoken lines, on-screen text, slogans, captions. Tone of voice, pace, and formality level (without interpretation).",
+        "6. Visual and Symbolic Details: Colors, lighting, props, gestures, symbols, cultural references. Any technology, vehicles, food, clothing brands, or recognizable items.",
+        "7. Audio and Music: Genre, tempo, instruments, sound effects, voice-over characteristics.",
+        "8. Visual Style and Editing: Camera movements, shot duration, transitions, pacing, framing style.",
+        "9. Call to Action: Any explicit CTA shown or spoken.",
+        "Describe everything fully, factually, and concretely, without adding analysis, assumptions, or opinions.",
     )
+    return "\n".join(lines)
 
 
 def load_video_frames(video_path: Path, target_fps: float = 2.0, max_frames: int = 256) -> List["Image.Image"]:
@@ -136,14 +130,9 @@ def load_video_frames(video_path: Path, target_fps: float = 2.0, max_frames: int
     return frames
 
 
-async def load_video_frames_async(video_path: Path) -> List["Image.Image"]:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(load_video_frames, video_path))
-
-
-async def async_main() -> None:
+def main() -> None:
     args = parse_args()
-    await install_dependencies()
+    install_dependencies()
 
     # Imports after dependency installation
     from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
@@ -157,23 +146,16 @@ async def async_main() -> None:
     prompt_text = build_prompt()
 
     print("[prepare] Decoding video frames with imageio to avoid native backend issues...")
-    frames: List[Image.Image] = await load_video_frames_async(args.video)
+    frames: List[Image.Image] = load_video_frames(args.video)
 
     print("[load] Loading model and processor (may take a while on first run)...")
-
-    async def _load_model_and_processor():
-        def _load():
-            model_local = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-                "openinterx/UGC-VideoCaptioner",
-                dtype="auto",
-                device_map={"": "cpu"},
-            )
-            processor_local = Qwen2_5OmniProcessor.from_pretrained("openinterx/UGC-VideoCaptioner")
-            return model_local, processor_local
-
-        return await asyncio.to_thread(_load)
-
-    model, processor = await _load_model_and_processor()
+    model_local = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+        "openinterx/UGC-VideoCaptioner",
+        dtype="auto",
+        device_map={"": "cpu"},
+        attn_implementation="flash_attention_2",
+    )
+    processor = Qwen2_5OmniProcessor.from_pretrained("openinterx/UGC-VideoCaptioner")
 
     conversation = [
         {
@@ -203,34 +185,23 @@ async def async_main() -> None:
         padding=True,
         use_audio_in_video=use_audio_in_video,
     )
-    inputs = inputs.to(model.device).to(model.dtype)
+    inputs = inputs.to(model_local.device).to(model_local.dtype)
 
     print("[infer] Generating caption...")
-
-    async def _generate():
-        def _run():
-            return model.generate(
-                **inputs,
-                use_audio_in_video=use_audio_in_video,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=True,
-                temperature=args.temperature,
-                top_p=args.top_p,
-            )
-
-        return await asyncio.to_thread(_run)
-
-    generated_tokens, audio = await _generate()
+    generated_tokens, audio = model_local.generate(
+        **inputs,
+        use_audio_in_video=use_audio_in_video,
+        max_new_tokens=args.max_new_tokens,
+        do_sample=True,
+        temperature=args.temperature,
+        top_p=args.top_p,
+    )
 
     if audio is not None:
         audio_path = Path("data/audios/010-30.wav")
         audio_path.parent.mkdir(parents=True, exist_ok=True)
         audio_waveform = audio.reshape(-1).detach().cpu().numpy()
-
-        def _write_audio() -> None:
-            sf.write(audio_path, audio_waveform, samplerate=24000)
-
-        await asyncio.to_thread(_write_audio)
+        sf.write(audio_path, audio_waveform, samplerate=24000)
         print(f"[audio] Saved synthesized narration to {audio_path}")
 
     captions = processor.batch_decode(
@@ -238,9 +209,15 @@ async def async_main() -> None:
     )
 
     print("\n=== Generated Caption ===")
-    for caption in captions:
-        print(caption.strip())
+    print("\n".join([caption.strip() for caption in captions]))
+    output_path = Path("outputs/captions") / f"{args.video.stem}.txt"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for caption in captions:
+            caption_stripped = caption.strip()
+            f.write(caption_stripped + "\n")
+    print(f"[output] Captions saved to {output_path}")
 
 
 if __name__ == "__main__":
-    asyncio.run(async_main())
+    main()
