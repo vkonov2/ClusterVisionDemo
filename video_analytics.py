@@ -132,6 +132,7 @@ OS2D_DIR = MODEL_DIR / "os2d"
 sys.path.insert(0, str(MODEL_DIR))
 
 from deepgaze_pytorch.deepgaze2e import DeepGazeIIE  # type: ignore  # noqa: E402
+from generate_unisal_saliency import render_heatmap  # type: ignore  # noqa: E402
 from craft.craft import CRAFT  # type: ignore  # noqa: E402
 from craft import craft_utils  # type: ignore  # noqa: E402
 from os2d.os2d.config import cfg  # type: ignore  # noqa: E402
@@ -181,10 +182,8 @@ def download_minio_object(client, uri: str, destination_dir: Path) -> Path:
     return local_path
 
 
-def overlay_heatmap_on_frame(frame_bgr: np.ndarray, prob_map: np.ndarray, alpha: float = 0.4) -> np.ndarray:
-    prob_normalized = cv2.normalize(prob_map, None, 0, 255, cv2.NORM_MINMAX)
-    prob_uint8 = np.clip(prob_normalized, 0, 255).astype(np.uint8)
-    heatmap = cv2.applyColorMap(prob_uint8, cv2.COLORMAP_JET)
+def overlay_heatmap_on_frame(frame_bgr: np.ndarray, prob_map: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+    heatmap = render_heatmap(prob_map)
     return cv2.addWeighted(frame_bgr, 1 - alpha, heatmap, alpha, 0)
 
 
@@ -233,7 +232,7 @@ class LogoDetection:
 
 def load_models(device: torch.device) -> tuple[DeepGazeIIE, CRAFT, Os2dModelContext]:
     # DeepGaze
-    deepgaze_model = DeepGazeIIE(pretrained=False)
+    deepgaze_model = DeepGazeIIE(pretrained=True)
     deepgaze_model.to(device)
     deepgaze_model.eval()
 
