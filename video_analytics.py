@@ -9,10 +9,13 @@ faulthandler.enable()
 import argparse
 import asyncio
 import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Sequence, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -20,6 +23,51 @@ import torch
 import torch.functional as F
 from PIL import Image
 from tqdm import tqdm
+
+import boto3
+from botocore.client import Config
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+# <<< ВСТАВИТЬ ВОТ ЭТО >>>
+def load_env_file(path: Path) -> None:
+    """Простая загрузка KEY=VALUE из .env-файла в os.environ."""
+    if not path.exists():
+        return
+
+    with path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            # пустые строки и комментарии пропускаем
+            if not line or line.startswith("#"):
+                continue
+            # только простые KEY=VALUE
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            # убираем возможные кавычки вокруг значения
+            if (
+                len(value) >= 2
+                and ((value[0] == value[-1]) and value[0] in ("'", '"'))
+            ):
+                value = value[1:-1]
+            # не затираем уже выставленные переменные окружения
+            os.environ.setdefault(key, value)
+
+
+# считаем, что .env.local-video-analytics лежит рядом со скриптом
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env.local-video-analytics"
+load_env_file(ENV_PATH)
+# <<< ДО СЮДА >>>
+
+# NOTE: we rely on the api package being importable from the repo root.
+from api.app.models.artifact import Artifact  # type: ignore
+from api.app.models.job import Job, JobStatus  # type: ignore
+from api.app.models.video import Video, VideoStatus  # type: ignore
+from api.app.models.user import User  # type: ignore  # noqa: F401
 
 # Ensure torch.meshgrid uses explicit indexing to avoid deprecation warnings.
 if not getattr(torch, "_meshgrid_default_indexing_set", False):
@@ -72,7 +120,7 @@ class _T:
     Normalize = Normalize
 
 
-T = _T()
+t = _T()
 # --- конец мини-замены ------------------------------------
 
 
@@ -84,6 +132,7 @@ OS2D_DIR = MODEL_DIR / "os2d"
 sys.path.insert(0, str(MODEL_DIR))
 
 from deepgaze_pytorch.deepgaze2e import DeepGazeIIE  # type: ignore  # noqa: E402
+from generate_unisal_saliency import render_heatmap  # type: ignore  # noqa: E402
 from craft.craft import CRAFT  # type: ignore  # noqa: E402
 from craft import craft_utils  # type: ignore  # noqa: E402
 from os2d.os2d.config import cfg  # type: ignore  # noqa: E402
@@ -97,6 +146,45 @@ CANVAS_SIZE = 1280
 MAG_RATIO = 1.5
 LOGO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 LOGO_SCORE_THRESHOLD = 0.45
+
+
+def parse_minio_path(value: str) -> tuple[str, str]:
+    """Extract bucket/key from an s3/http(s) URL that points to MinIO."""
+
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https", "s3"}:
+        path = parsed.path.lstrip("/")
+        if not path or "/" not in path:
+            raise ValueError("URL must contain bucket and key, e.g. http://host/bucket/key")
+        bucket, key = path.split("/", 1)
+        return bucket, key
+
+    raise ValueError("Unsupported URL: provide http(s) or s3 URL pointing to MinIO")
+
+
+def build_minio_client(endpoint: str | None, access_key: str | None, secret_key: str | None):
+    if not endpoint or not access_key or not secret_key:
+        raise ValueError("MINIO endpoint/access/secret are required for remote operations")
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def download_minio_object(client, uri: str, destination_dir: Path) -> Path:
+    bucket, key = parse_minio_path(uri)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    local_path = destination_dir / Path(key).name
+    client.download_file(bucket, key, str(local_path))
+    return local_path
+
+
+def overlay_heatmap_on_frame(frame_bgr: np.ndarray, prob_map: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+    heatmap = render_heatmap(prob_map)
+    return cv2.addWeighted(frame_bgr, 1 - alpha, heatmap, alpha, 0)
 
 
 @dataclass
@@ -144,7 +232,7 @@ class LogoDetection:
 
 def load_models(device: torch.device) -> tuple[DeepGazeIIE, CRAFT, Os2dModelContext]:
     # DeepGaze
-    deepgaze_model = DeepGazeIIE(pretrained=False)
+    deepgaze_model = DeepGazeIIE(pretrained=True)
     deepgaze_model.to(device)
     deepgaze_model.eval()
 
@@ -176,8 +264,8 @@ def load_models(device: torch.device) -> tuple[DeepGazeIIE, CRAFT, Os2dModelCont
     net.eval()
     net.to(device)
 
-    transform_image = T.Compose(
-        [T.ToTensor(), T.Normalize(img_normalization["mean"], img_normalization["std"])]
+    transform_image = t.Compose(
+        [t.ToTensor(), t.Normalize(img_normalization["mean"], img_normalization["std"])]
     )
 
     frame_target_size = 800
@@ -199,6 +287,13 @@ def load_models(device: torch.device) -> tuple[DeepGazeIIE, CRAFT, Os2dModelCont
     )
 
     return deepgaze_model, craft_model, os2d_ctx
+
+
+def build_db_sessionmaker(database_url: str | None):
+    if not database_url:
+        return None
+    engine = create_engine(database_url, pool_pre_ping=True)
+    return sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 def read_video_frames(video_path: Path | None, seconds: float | None, frame_skip: int) -> VideoFrames:
@@ -535,6 +630,45 @@ def serialize_logo_detections(detections: Sequence[LogoDetection]) -> list[dict[
     ]
 
 
+def update_statuses(
+    db,
+    *,
+    job,
+    video,
+    job_status: JobStatus | None = None,
+    video_status: VideoStatus | None = None,
+    progress: int | None = None,
+    error: str | None = None,
+):
+    if not db:
+        return
+
+    changed = False
+    if job is not None and job_status is not None:
+        job.status = job_status
+        changed = True
+    if job is not None and progress is not None:
+        job.progress = progress
+        changed = True
+    if job is not None and error is not None:
+        job.error = error
+        changed = True
+    if video is not None and video_status is not None:
+        video.status = video_status
+        changed = True
+    if changed:
+        db.commit()
+
+
+def register_artifact(db, *, video_id: str | None, bucket: str, key: str, artifact_type: str):
+    if db is None or video_id is None:
+        return
+    uri = f"s3://{bucket}/{key}"
+    artifact = Artifact(video_id=video_id, type=artifact_type, uri=uri)
+    db.add(artifact)
+    db.commit()
+
+
 async def process_video(
     video_path: Path | None,
     logo_path: Path | None,
@@ -546,8 +680,9 @@ async def process_video(
     chunk_size: int,
     device: torch.device,
     output_path: Path,
+    overlay_output_path: Path,
 ) -> dict[str, Any]:
-    """Processes a video, runs all detectors per frame, and exports analytics to JSON."""
+    """Processes a video, runs all detectors per frame, and exports analytics to JSON and overlay video."""
 
     frames_info = await asyncio.to_thread(read_video_frames, video_path, seconds, frame_skip)
     height, width = frames_info.frame_size
@@ -572,94 +707,109 @@ async def process_video(
     total_frames = len(frames_info.frames_bgr)
     progress = tqdm(total=total_frames, desc="Processing frames", unit="frame")
 
-    for start in range(0, total_frames, chunk):
-        batch_frames = frames_info.frames_bgr[start : start + chunk]
-        tensors = [frame_to_tensor(frame) for frame in batch_frames]
-        images = torch.stack(tensors).to(device)
-        cb = centerbias_tensor.unsqueeze(0).expand(images.size(0), -1, -1)
+    overlay_output_path = overlay_output_path.resolve()
+    overlay_output_path.parent.mkdir(parents=True, exist_ok=True)
+    fps = frames_info.fps if frames_info.fps > 0 else 25.0
+    writer = cv2.VideoWriter(
+        str(overlay_output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
 
-        with torch.no_grad():
-            log_density = deepgaze_model(images, cb)
-        prob_maps = log_density.squeeze(1).detach().cpu().numpy()
+    try:
+        for start in range(0, total_frames, chunk):
+            batch_frames = frames_info.frames_bgr[start : start + chunk]
+            tensors = [frame_to_tensor(frame) for frame in batch_frames]
+            images = torch.stack(tensors).to(device)
+            cb = centerbias_tensor.unsqueeze(0).expand(images.size(0), -1, -1)
 
-        for offset, frame_bgr in enumerate(batch_frames):
-            frame_index = start + offset
-            prob_map = log_density_to_prob(prob_maps[offset])
-            text_boxes = await asyncio.to_thread(
-                detect_text_boxes,
-                frame_bgr,
-                craft_model,
-                device,
-                TEXT_THRESHOLD,
-                LINK_THRESHOLD,
-                LOW_TEXT,
-                CANVAS_SIZE,
-                MAG_RATIO,
-            )
-            logo_detections = await asyncio.to_thread(
-                detect_logos_on_frame,
-                frame_bgr,
-                logo_templates,
-                os2d_ctx,
-            )
+            with torch.no_grad():
+                log_density = deepgaze_model(images, cb)
+            prob_maps = log_density.squeeze(1).detach().cpu().numpy()
 
-            mean_value = float(prob_map.mean())
-            peak_value = float(prob_map.max())
-            conc10 = compute_concentration(prob_map, 0.10)
-            conc20 = compute_concentration(prob_map, 0.20)
-            text_ratio = compute_text_energy_ratio(prob_map, text_boxes)
-            logo_ratio = compute_logo_energy_ratio(prob_map, logo_detections)
-            max_position = np.unravel_index(int(prob_map.argmax()), prob_map.shape)
-            timestamp = (frame_index / frames_info.fps) if frames_info.fps > 0 else None
+            for offset, frame_bgr in enumerate(batch_frames):
+                frame_index = start + offset
+                prob_map = log_density_to_prob(prob_maps[offset])
+                text_boxes = await asyncio.to_thread(
+                    detect_text_boxes,
+                    frame_bgr,
+                    craft_model,
+                    device,
+                    TEXT_THRESHOLD,
+                    LINK_THRESHOLD,
+                    LOW_TEXT,
+                    CANVAS_SIZE,
+                    MAG_RATIO,
+                )
+                logo_detections = await asyncio.to_thread(
+                    detect_logos_on_frame,
+                    frame_bgr,
+                    logo_templates,
+                    os2d_ctx,
+                )
 
-            per_frame.append(
-                {
-                    "frame_index": frame_index,
-                    "time_seconds": timestamp,
-                    "mean": mean_value,
-                    "peak": peak_value,
-                    "concentration_10": conc10,
-                    "concentration_20": conc20,
-                    "text_energy_ratio": text_ratio,
-                    "logo_energy_ratio": logo_ratio,
-                    "max_position": [int(max_position[1]), int(max_position[0])],
-                    "text_boxes": serialize_boxes(text_boxes),
-                    "logos": serialize_logo_detections(logo_detections),
-                }
-            )
+                mean_value = float(prob_map.mean())
+                peak_value = float(prob_map.max())
+                conc10 = compute_concentration(prob_map, 0.10)
+                conc20 = compute_concentration(prob_map, 0.20)
+                text_ratio = compute_text_energy_ratio(prob_map, text_boxes)
+                logo_ratio = compute_logo_energy_ratio(prob_map, logo_detections)
+                max_position = np.unravel_index(int(prob_map.argmax()), prob_map.shape)
+                timestamp = (frame_index / frames_info.fps) if frames_info.fps > 0 else None
 
-            if prev_prob_map is not None and prev_max_position is not None and prev_frame_index is not None:
-                diff_map = prob_map - prev_prob_map
-                vol1_mean = float(np.mean(np.abs(diff_map)))
-                vol1_rms = float(np.sqrt(np.mean(np.square(diff_map))))
-                vol1_max = float(np.max(np.abs(diff_map)))
-
-                prev_pos = np.array(prev_max_position, dtype=np.float32)
-                curr_pos = np.array(max_position, dtype=np.float32)
-                dist_px = float(np.linalg.norm(curr_pos - prev_pos))
-                dist_norm = float(dist_px / diagonal)
-
-                volatility_pairs.append(
+                per_frame.append(
                     {
-                        "frame_a": prev_frame_index,
-                        "frame_b": frame_index,
-                        "time_a": prev_timestamp,
-                        "time_b": timestamp,
-                        "vol1_mean": vol1_mean,
-                        "vol1_rms": vol1_rms,
-                        "vol1_max": vol1_max,
-                        "vol2_value": dist_px,
-                        "vol2_normalized": dist_norm,
+                        "frame_index": frame_index,
+                        "time_seconds": timestamp,
+                        "mean": mean_value,
+                        "peak": peak_value,
+                        "concentration_10": conc10,
+                        "concentration_20": conc20,
+                        "text_energy_ratio": text_ratio,
+                        "logo_energy_ratio": logo_ratio,
+                        "max_position": [int(max_position[1]), int(max_position[0])],
+                        "text_boxes": serialize_boxes(text_boxes),
+                        "logos": serialize_logo_detections(logo_detections),
                     }
                 )
 
-            prev_prob_map = prob_map
-            prev_max_position = max_position
-            prev_frame_index = frame_index
-            prev_timestamp = timestamp
-        progress.update(len(batch_frames))
+                if prev_prob_map is not None and prev_max_position is not None and prev_frame_index is not None:
+                    diff_map = prob_map - prev_prob_map
+                    vol1_mean = float(np.mean(np.abs(diff_map)))
+                    vol1_rms = float(np.sqrt(np.mean(np.square(diff_map))))
+                    vol1_max = float(np.max(np.abs(diff_map)))
 
-    progress.close()
+                    prev_pos = np.array(prev_max_position, dtype=np.float32)
+                    curr_pos = np.array(max_position, dtype=np.float32)
+                    dist_px = float(np.linalg.norm(curr_pos - prev_pos))
+                    dist_norm = float(dist_px / diagonal)
+
+                    volatility_pairs.append(
+                        {
+                            "frame_a": prev_frame_index,
+                            "frame_b": frame_index,
+                            "time_a": prev_timestamp,
+                            "time_b": timestamp,
+                            "vol1_mean": vol1_mean,
+                            "vol1_rms": vol1_rms,
+                            "vol1_max": vol1_max,
+                            "vol2_value": dist_px,
+                            "vol2_normalized": dist_norm,
+                        }
+                    )
+
+                prev_prob_map = prob_map
+                prev_max_position = max_position
+                prev_frame_index = frame_index
+                prev_timestamp = timestamp
+
+                overlay_frame = overlay_heatmap_on_frame(frame_bgr, prob_map)
+                writer.write(overlay_frame)
+            progress.update(len(batch_frames))
+    finally:
+        writer.release()
+        progress.close()
 
     metric_keys = [
         "mean",
@@ -717,12 +867,14 @@ async def process_video(
         "logo_templates": [template.name for template in logo_templates],
         "series": series,
         "frames": per_frame,
+        "overlay_video": str(overlay_output_path),
     }
 
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(analytics, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[done] Analytics saved to {output_path}")
+    print(f"[done] Overlay video saved to {overlay_output_path}")
     return analytics
 
 
@@ -730,11 +882,74 @@ async def async_main() -> int:
     parser = argparse.ArgumentParser(description="Получение аналитики по видео")
     parser.add_argument("--video", type=Path, default=None, help="Путь к видео")
     parser.add_argument("--logo", type=Path, default=None, help="Путь к логотипу")
+    parser.add_argument("--video-url", type=str, default=None, help="MinIO HTTP/S3 URL к видео")
+    parser.add_argument("--logo-url", type=str, default=None, help="MinIO HTTP/S3 URL к логотипу")
+    parser.add_argument("--job-id", type=str, default=None, help="ID job для обновления статуса")
+    parser.add_argument("--video-id", type=str, default=None, help="ID видео для обновления статуса/артефакта")
+    parser.add_argument(
+        "--database-url",
+        type=str,
+        default=os.getenv("DATABASE_URL"),
+        help="Postgres DATABASE_URL",
+    )
+    parser.add_argument(
+        "--minio-endpoint",
+        type=str,
+        default=os.getenv("MINIO_ENDPOINT_INTERNAL") or os.getenv("MINIO_ENDPOINT_PUBLIC"),
+        help="MinIO endpoint (внутренний)",
+    )
+    parser.add_argument(
+        "--minio-access-key",
+        type=str,
+        default=os.getenv("MINIO_ACCESS_KEY"),
+        help="MinIO access key",
+    )
+    parser.add_argument(
+        "--minio-secret-key",
+        type=str,
+        default=os.getenv("MINIO_SECRET_KEY"),
+        help="MinIO secret key",
+    )
+    parser.add_argument(
+        "--results-json-bucket",
+        type=str,
+        default=os.getenv("MINIO_BUCKET_RESULTS_JSON", "results-json"),
+        help="Bucket для сохранения analytics.json",
+    )
+    parser.add_argument(
+        "--results-video-bucket",
+        type=str,
+        default=os.getenv("MINIO_BUCKET_RESULTS", "results"),
+        help="Bucket для сохранения overlay видео",
+    )
+    parser.add_argument(
+        "--result-json-key",
+        type=str,
+        default=None,
+        help="Ключ внутри results-json bucket (по умолчанию video_id/video_analytics.json)",
+    )
+    parser.add_argument(
+        "--result-video-key",
+        type=str,
+        default=None,
+        help="Ключ внутри results bucket (по умолчанию video_id/video_analytics_overlay.mp4)",
+    )
+    parser.add_argument(
+        "--skip-minio-upload",
+        action="store_true",
+        help="Не загружать результат в MinIO",
+    )
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("analytics.json"),
         help="Путь к JSON-отчёту",
+    )
+    parser.add_argument(
+        "--output-video",
+        type=Path,
+        default=Path("analytics_overlay.mp4"),
+        help="Путь к overlay-видео",
     )
     parser.add_argument(
         "--seconds",
@@ -747,25 +962,128 @@ async def async_main() -> int:
     parser.add_argument("--device", type=str, default=None, help="Устройство (cpu/cuda)")
     args = parser.parse_args()
 
-    if args.video is not None and not args.video.exists():
-        raise FileNotFoundError(f"Видео не найдено: {args.video}")
-    if args.logo is not None and not args.logo.exists():
+    if args.video_url is None:
+        if args.video is None:
+            raise ValueError("Укажите --video или --video-url")
+        if not args.video.exists():
+            raise FileNotFoundError(f"Видео не найдено: {args.video}")
+
+    if args.logo_url is None and args.logo is not None and not args.logo.exists():
         raise FileNotFoundError(f"Логотип не найден: {args.logo}")
 
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    deepgaze_model, craft_model, os2d_ctx = load_models(device)
-    await process_video(
-        video_path=args.video,
-        logo_path=args.logo,
-        deepgaze_model=deepgaze_model,
-        craft_model=craft_model,
-        os2d_ctx=os2d_ctx,
-        seconds=args.seconds,
-        frame_skip=args.frame_skip,
-        chunk_size=args.chunk_size,
-        device=device,
-        output_path=args.output,
+    minio_client = None
+    need_minio = bool(args.video_url or args.logo_url or not args.skip_minio_upload)
+    if need_minio:
+        minio_client = build_minio_client(
+            args.minio_endpoint, args.minio_access_key, args.minio_secret_key
+        )
+    SessionLocal = build_db_sessionmaker(args.database_url)
+    db = SessionLocal() if SessionLocal and (args.job_id or args.video_id) else None
+    job = db.get(Job, args.job_id) if db and args.job_id else None
+    video = db.get(Video, args.video_id) if db and args.video_id else None
+
+    update_statuses(
+        db,
+        job=job,
+        video=video,
+        job_status=JobStatus.STARTED,
+        video_status=VideoStatus.PROCESSING,
+        progress=0,
     )
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            video_path = args.video
+            logo_path = args.logo
+
+            if args.video_url:
+                if not minio_client:
+                    raise ValueError("MinIO клиент не инициализирован для загрузки видео")
+                video_path = download_minio_object(minio_client, args.video_url, tmp_path)
+
+            if args.logo_url:
+                if not minio_client:
+                    raise ValueError("MinIO клиент не инициализирован для загрузки логотипа")
+                logo_path = download_minio_object(minio_client, args.logo_url, tmp_path)
+
+            device = torch.device(
+                args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            )
+            deepgaze_model, craft_model, os2d_ctx = load_models(device)
+            await process_video(
+                video_path=video_path,
+                logo_path=logo_path,
+                deepgaze_model=deepgaze_model,
+                craft_model=craft_model,
+                os2d_ctx=os2d_ctx,
+                seconds=args.seconds,
+                frame_skip=args.frame_skip,
+                chunk_size=args.chunk_size,
+                device=device,
+                output_path=args.output,
+                overlay_output_path=args.output_video,
+            )
+
+        if not args.skip_minio_upload:
+            if not minio_client:
+                raise ValueError("MinIO клиент обязателен для загрузки результатов")
+
+            default_json_key = (
+                f"{args.video_id}/video_analytics.json"
+                if args.video_id
+                else args.output.name
+            )
+            json_key = args.result_json_key or default_json_key
+            minio_client.upload_file(
+                str(args.output.resolve()), args.results_json_bucket, json_key
+            )
+            register_artifact(
+                db,
+                video_id=args.video_id,
+                bucket=args.results_json_bucket,
+                key=json_key,
+                artifact_type="video_analytics.json",
+            )
+
+            default_video_key = (
+                f"{args.video_id}/video_analytics_overlay.mp4"
+                if args.video_id
+                else args.output_video.name
+            )
+            video_key = args.result_video_key or default_video_key
+            minio_client.upload_file(
+                str(args.output_video.resolve()), args.results_video_bucket, video_key
+            )
+            register_artifact(
+                db,
+                video_id=args.video_id,
+                bucket=args.results_video_bucket,
+                key=video_key,
+                artifact_type="video_analytics_overlay.mp4",
+            )
+
+        update_statuses(
+            db,
+            job=job,
+            video=video,
+            job_status=JobStatus.DONE,
+            video_status=VideoStatus.DONE,
+            progress=100,
+        )
+    except Exception as exc:
+        update_statuses(
+            db,
+            job=job,
+            video=video,
+            job_status=JobStatus.FAILED,
+            video_status=VideoStatus.FAILED,
+            error=str(exc),
+        )
+        raise
+    finally:
+        if db is not None:
+            db.close()
 
     return 0
 
