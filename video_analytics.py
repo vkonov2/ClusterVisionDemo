@@ -9,10 +9,13 @@ faulthandler.enable()
 import argparse
 import asyncio
 import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Sequence, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -20,6 +23,16 @@ import torch
 import torch.functional as F
 from PIL import Image
 from tqdm import tqdm
+
+import boto3
+from botocore.client import Config
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+# NOTE: we rely on the api package being importable from the repo root.
+from api.app.models.artifact import Artifact  # type: ignore
+from api.app.models.job import Job, JobStatus  # type: ignore
+from api.app.models.video import Video, VideoStatus  # type: ignore
 
 # Ensure torch.meshgrid uses explicit indexing to avoid deprecation warnings.
 if not getattr(torch, "_meshgrid_default_indexing_set", False):
@@ -97,6 +110,40 @@ CANVAS_SIZE = 1280
 MAG_RATIO = 1.5
 LOGO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 LOGO_SCORE_THRESHOLD = 0.45
+
+
+def parse_minio_path(value: str) -> tuple[str, str]:
+    """Extract bucket/key from an s3/http(s) URL that points to MinIO."""
+
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https", "s3"}:
+        path = parsed.path.lstrip("/")
+        if not path or "/" not in path:
+            raise ValueError("URL must contain bucket and key, e.g. http://host/bucket/key")
+        bucket, key = path.split("/", 1)
+        return bucket, key
+
+    raise ValueError("Unsupported URL: provide http(s) or s3 URL pointing to MinIO")
+
+
+def build_minio_client(endpoint: str | None, access_key: str | None, secret_key: str | None):
+    if not endpoint or not access_key or not secret_key:
+        raise ValueError("MINIO endpoint/access/secret are required for remote operations")
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def download_minio_object(client, uri: str, destination_dir: Path) -> Path:
+    bucket, key = parse_minio_path(uri)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    local_path = destination_dir / Path(key).name
+    client.download_file(bucket, key, str(local_path))
+    return local_path
 
 
 @dataclass
@@ -199,6 +246,13 @@ def load_models(device: torch.device) -> tuple[DeepGazeIIE, CRAFT, Os2dModelCont
     )
 
     return deepgaze_model, craft_model, os2d_ctx
+
+
+def build_db_sessionmaker(database_url: str | None):
+    if not database_url:
+        return None
+    engine = create_engine(database_url, pool_pre_ping=True)
+    return sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 def read_video_frames(video_path: Path | None, seconds: float | None, frame_skip: int) -> VideoFrames:
@@ -535,6 +589,45 @@ def serialize_logo_detections(detections: Sequence[LogoDetection]) -> list[dict[
     ]
 
 
+def update_statuses(
+    db,
+    *,
+    job,
+    video,
+    job_status: JobStatus | None = None,
+    video_status: VideoStatus | None = None,
+    progress: int | None = None,
+    error: str | None = None,
+):
+    if not db:
+        return
+
+    changed = False
+    if job is not None and job_status is not None:
+        job.status = job_status
+        changed = True
+    if job is not None and progress is not None:
+        job.progress = progress
+        changed = True
+    if job is not None and error is not None:
+        job.error = error
+        changed = True
+    if video is not None and video_status is not None:
+        video.status = video_status
+        changed = True
+    if changed:
+        db.commit()
+
+
+def register_artifact(db, *, video_id: str | None, bucket: str, key: str, artifact_type: str):
+    if db is None or video_id is None:
+        return
+    uri = f"s3://{bucket}/{key}"
+    artifact = Artifact(video_id=video_id, type=artifact_type, uri=uri)
+    db.add(artifact)
+    db.commit()
+
+
 async def process_video(
     video_path: Path | None,
     logo_path: Path | None,
@@ -730,6 +823,51 @@ async def async_main() -> int:
     parser = argparse.ArgumentParser(description="Получение аналитики по видео")
     parser.add_argument("--video", type=Path, default=None, help="Путь к видео")
     parser.add_argument("--logo", type=Path, default=None, help="Путь к логотипу")
+    parser.add_argument("--video-url", type=str, default=None, help="MinIO HTTP/S3 URL к видео")
+    parser.add_argument("--logo-url", type=str, default=None, help="MinIO HTTP/S3 URL к логотипу")
+    parser.add_argument("--job-id", type=str, default=None, help="ID job для обновления статуса")
+    parser.add_argument("--video-id", type=str, default=None, help="ID видео для обновления статуса/артефакта")
+    parser.add_argument(
+        "--database-url",
+        type=str,
+        default=os.getenv("DATABASE_URL"),
+        help="Postgres DATABASE_URL",
+    )
+    parser.add_argument(
+        "--minio-endpoint",
+        type=str,
+        default=os.getenv("MINIO_ENDPOINT_INTERNAL") or os.getenv("MINIO_ENDPOINT_PUBLIC"),
+        help="MinIO endpoint (внутренний)",
+    )
+    parser.add_argument(
+        "--minio-access-key",
+        type=str,
+        default=os.getenv("MINIO_ACCESS_KEY"),
+        help="MinIO access key",
+    )
+    parser.add_argument(
+        "--minio-secret-key",
+        type=str,
+        default=os.getenv("MINIO_SECRET_KEY"),
+        help="MinIO secret key",
+    )
+    parser.add_argument(
+        "--results-bucket",
+        type=str,
+        default=os.getenv("MINIO_BUCKET_RESULTS"),
+        help="Bucket для сохранения analytics.json",
+    )
+    parser.add_argument(
+        "--result-key",
+        type=str,
+        default=None,
+        help="Ключ внутри results bucket (по умолчанию video_id/video_analytics.json)",
+    )
+    parser.add_argument(
+        "--skip-minio-upload",
+        action="store_true",
+        help="Не загружать результат в MinIO",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -747,25 +885,111 @@ async def async_main() -> int:
     parser.add_argument("--device", type=str, default=None, help="Устройство (cpu/cuda)")
     args = parser.parse_args()
 
-    if args.video is not None and not args.video.exists():
-        raise FileNotFoundError(f"Видео не найдено: {args.video}")
-    if args.logo is not None and not args.logo.exists():
+    if args.video_url is None:
+        if args.video is None:
+            raise ValueError("Укажите --video или --video-url")
+        if not args.video.exists():
+            raise FileNotFoundError(f"Видео не найдено: {args.video}")
+
+    if args.logo_url is None and args.logo is not None and not args.logo.exists():
         raise FileNotFoundError(f"Логотип не найден: {args.logo}")
 
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    deepgaze_model, craft_model, os2d_ctx = load_models(device)
-    await process_video(
-        video_path=args.video,
-        logo_path=args.logo,
-        deepgaze_model=deepgaze_model,
-        craft_model=craft_model,
-        os2d_ctx=os2d_ctx,
-        seconds=args.seconds,
-        frame_skip=args.frame_skip,
-        chunk_size=args.chunk_size,
-        device=device,
-        output_path=args.output,
+    minio_client = None
+    need_minio = bool(args.video_url or args.logo_url or not args.skip_minio_upload)
+    if need_minio:
+        minio_client = build_minio_client(
+            args.minio_endpoint, args.minio_access_key, args.minio_secret_key
+        )
+    SessionLocal = build_db_sessionmaker(args.database_url)
+    db = SessionLocal() if SessionLocal and (args.job_id or args.video_id) else None
+    job = db.get(Job, args.job_id) if db and args.job_id else None
+    video = db.get(Video, args.video_id) if db and args.video_id else None
+
+    update_statuses(
+        db,
+        job=job,
+        video=video,
+        job_status=JobStatus.STARTED,
+        video_status=VideoStatus.PROCESSING,
+        progress=0,
     )
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            video_path = args.video
+            logo_path = args.logo
+
+            if args.video_url:
+                if not minio_client:
+                    raise ValueError("MinIO клиент не инициализирован для загрузки видео")
+                video_path = download_minio_object(minio_client, args.video_url, tmp_path)
+
+            if args.logo_url:
+                if not minio_client:
+                    raise ValueError("MinIO клиент не инициализирован для загрузки логотипа")
+                logo_path = download_minio_object(minio_client, args.logo_url, tmp_path)
+
+            device = torch.device(
+                args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            )
+            deepgaze_model, craft_model, os2d_ctx = load_models(device)
+            await process_video(
+                video_path=video_path,
+                logo_path=logo_path,
+                deepgaze_model=deepgaze_model,
+                craft_model=craft_model,
+                os2d_ctx=os2d_ctx,
+                seconds=args.seconds,
+                frame_skip=args.frame_skip,
+                chunk_size=args.chunk_size,
+                device=device,
+                output_path=args.output,
+            )
+
+        if not args.skip_minio_upload:
+            if not minio_client:
+                raise ValueError("MinIO клиент обязателен для загрузки результатов")
+            if not args.results_bucket:
+                raise ValueError("Укажите --results-bucket или MINIO_BUCKET_RESULTS")
+            default_key = (
+                f"{args.video_id}/video_analytics.json"
+                if args.video_id
+                else args.output.name
+            )
+            result_key = args.result_key or default_key
+            minio_client.upload_file(
+                str(args.output.resolve()), args.results_bucket, result_key
+            )
+            register_artifact(
+                db,
+                video_id=args.video_id,
+                bucket=args.results_bucket,
+                key=result_key,
+                artifact_type="video_analytics.json",
+            )
+
+        update_statuses(
+            db,
+            job=job,
+            video=video,
+            job_status=JobStatus.DONE,
+            video_status=VideoStatus.DONE,
+            progress=100,
+        )
+    except Exception as exc:
+        update_statuses(
+            db,
+            job=job,
+            video=video,
+            job_status=JobStatus.FAILED,
+            video_status=VideoStatus.FAILED,
+            error=str(exc),
+        )
+        raise
+    finally:
+        if db is not None:
+            db.close()
 
     return 0
 
