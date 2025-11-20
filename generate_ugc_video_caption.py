@@ -104,7 +104,7 @@ def build_prompt() -> str:
     return "\n".join(lines)
 
 
-def load_video_frames(video_path: Path, target_fps: float = 2.0, max_frames: int = 256) -> List["Image.Image"]:
+def load_video_frames(video_path: Path, target_fps: float = 2.0, max_frames: int = 256):
     """Decode a video into RGB frames using imageio with simple downsampling."""
 
     import imageio.v2 as imageio
@@ -153,7 +153,7 @@ def main() -> None:
         "openinterx/UGC-VideoCaptioner",
         dtype="auto",
         device_map={"": "cpu"},
-        attn_implementation="flash_attention_2",
+        # attn_implementation="flash_attention_2",
     )
     processor = Qwen2_5OmniProcessor.from_pretrained("openinterx/UGC-VideoCaptioner")
 
