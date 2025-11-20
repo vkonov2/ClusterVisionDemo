@@ -1,0 +1,49 @@
+# === Общие ===
+APP_NAME=SynapSight
+APP_ENV=dev
+DOMAIN=localhost
+API_PORT=8000
+
+
+# === Postgres ===
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+POSTGRES_DB=synapsight
+POSTGRES_USER=synap
+POSTGRES_PASSWORD=secret
+DATABASE_URL=postgresql+psycopg2://synap:secret@postgres:5432/synapsight
+
+
+# === Redis ===
+REDIS_URL=redis://redis:6379/0
+CELERY_BROKER_URL=redis://redis:6379/1
+CELERY_RESULT_BACKEND=redis://redis:6379/2
+REDIS_URL_PUBSUB=redis://redis:6379/3
+
+# === MinIO ===
+MINIO_ENDPOINT_INTERNAL=http://minio:9000
+MINIO_ENDPOINT_PUBLIC=http://localhost:9000
+MINIO_REGION=us-east-1
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadminsecret
+MINIO_BUCKET_UPLOADS=uploads
+MINIO_BUCKET_RESULTS=results
+
+
+# === Аутентификация/сессии ===
+SECRET_KEY=change_me_to_random_32_bytes_hex
+SESSION_COOKIE_NAME=sid
+SESSION_TTL_SECONDS=2592000 # 30 дней
+
+
+# === CORS (для фронта) ===
+CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+
+
+# === Инструменты ===
+FFMPEG_BIN=ffmpeg
+FFPROBE_BIN=ffprobe
+
+
+# === Flower ===
+FLOWER_PORT=5555
