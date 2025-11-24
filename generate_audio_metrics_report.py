@@ -74,9 +74,35 @@ def extract_audio(video_path: Path, target_sr: int = 48000) -> Tuple[np.ndarray,
 
 def compute_loudness_metrics(audio: np.ndarray, sr: int) -> LoudnessMetrics:
     meter = pyln.Meter(sr)  # ITU-R BS.1770 meter with K-weighting
+
+    def _sliding_loudness(window_s: float, hop_s: float) -> Tuple[np.ndarray, np.ndarray]:
+        window = int(window_s * sr)
+        hop = max(1, int(hop_s * sr))
+        if len(audio) == 0:
+            return np.array([]), np.array([])
+
+        values: list[float] = []
+        centers: list[float] = []
+
+        if len(audio) < window:
+            try:
+                values.append(float(meter.integrated_loudness(audio)))
+            except Exception:
+                values.append(float("nan"))
+            centers.append(len(audio) / (2 * sr))
+        else:
+            for start in range(0, len(audio) - window + 1, hop):
+                segment = audio[start : start + window]
+                try:
+                    loudness_value = float(meter.integrated_loudness(segment))
+                except Exception:
+                    loudness_value = float("nan")
+                values.append(loudness_value)
+                centers.append((start + window / 2) / sr)
+
+        return np.array(centers), np.array(values)
+
     integrated_lufs = meter.integrated_loudness(audio)
-    short_term_lufs = meter.loudness_shortterm(audio)
-    momentary_lufs = meter.loudness_momentary(audio)
     lra = meter.loudness_range(audio)
     true_peak_dbfs = meter.true_peak(audio)
 
@@ -84,10 +110,8 @@ def compute_loudness_metrics(audio: np.ndarray, sr: int) -> LoudnessMetrics:
     rms_dbfs = 20 * np.log10(max(rms_linear, 1e-12))
     crest_factor_db = true_peak_dbfs - rms_dbfs
 
-    # Pyloudnorm uses a hop size equal to its block size for momentary measurements.
-    block_size = meter.block_size
-    short_term_times = np.arange(len(short_term_lufs)) * block_size
-    momentary_times = np.arange(len(momentary_lufs)) * block_size
+    short_term_times, short_term_lufs = _sliding_loudness(window_s=3.0, hop_s=0.5)
+    momentary_times, momentary_lufs = _sliding_loudness(window_s=0.4, hop_s=0.1)
 
     hook_mask = (short_term_times >= 0) & (short_term_times < 5)
     baseline_mask = (short_term_times >= 5) & (short_term_times < 15)
@@ -353,13 +377,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--video-path",
         type=Path,
-        default=Path("data/video/000-youtube.mp4"),
+        default=Path("data/videos/000-youtube.mp4"),
         help="Путь к видеофайлу",
     )
     parser.add_argument(
         "--output-html",
         type=Path,
-        default=Path("data/audio_report.html"),
+        default=Path("outputs/audio_report.html"),
         help="Путь для сохранения HTML отчёта",
     )
     return parser.parse_args()
