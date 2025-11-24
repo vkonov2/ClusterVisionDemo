@@ -72,6 +72,23 @@ def extract_audio(video_path: Path, target_sr: int = 48000) -> Tuple[np.ndarray,
     return waveform, sr
 
 
+def compute_true_peak_dbfs(audio: np.ndarray, sr: int) -> float:
+    """Approximate true peak using 4x oversampling to catch inter-sample peaks."""
+    if audio.size == 0:
+        return float("nan")
+
+    oversample_factor = 4
+    try:
+        upsampled = librosa.resample(audio, orig_sr=sr, target_sr=sr * oversample_factor)
+    except Exception:
+        upsampled = audio
+
+    peak_linear = float(np.max(np.abs(upsampled)))
+    if peak_linear <= 0:
+        return float("nan")
+    return float(20 * np.log10(peak_linear))
+
+
 def compute_loudness_metrics(audio: np.ndarray, sr: int) -> LoudnessMetrics:
     meter = pyln.Meter(sr)  # ITU-R BS.1770 meter with K-weighting
 
@@ -103,7 +120,7 @@ def compute_loudness_metrics(audio: np.ndarray, sr: int) -> LoudnessMetrics:
         return np.array(centers), np.array(values)
 
     integrated_lufs = meter.integrated_loudness(audio)
-    true_peak_dbfs = meter.true_peak(audio)
+    true_peak_dbfs = compute_true_peak_dbfs(audio, sr)
 
     rms_linear = np.sqrt(np.mean(np.square(audio)))
     rms_dbfs = 20 * np.log10(max(rms_linear, 1e-12))
