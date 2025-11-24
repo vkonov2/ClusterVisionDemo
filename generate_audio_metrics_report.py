@@ -44,6 +44,7 @@ class TempoMetrics:
     percussive_ratio_hook: float
     tempo_stability: float | None
     beat_times: np.ndarray
+    beat_intervals: np.ndarray
 
 
 @dataclass
@@ -190,6 +191,7 @@ def compute_tempo_metrics(audio: np.ndarray, sr: int) -> TempoMetrics:
         intervals = np.diff(beat_times)
         tempo_stability = float(np.std(intervals))
     else:
+        intervals = np.array([])
         tempo_stability = None
 
     harmonic, percussive = librosa.effects.hpss(audio)
@@ -210,6 +212,7 @@ def compute_tempo_metrics(audio: np.ndarray, sr: int) -> TempoMetrics:
         percussive_ratio_hook=percussive_ratio_hook,
         tempo_stability=tempo_stability,
         beat_times=beat_times,
+        beat_intervals=intervals,
     )
 
 
@@ -276,12 +279,61 @@ def build_loudness_figure(metrics: LoudnessMetrics) -> go.Figure:
             name="Short-Term (3 с)",
         )
     )
+    fig.add_hrect(
+        y0=metrics.integrated_lufs - metrics.lra / 2 if np.isfinite(metrics.lra) else None,
+        y1=metrics.integrated_lufs + metrics.lra / 2 if np.isfinite(metrics.lra) else None,
+        fillcolor="LightSkyBlue",
+        opacity=0.2,
+        layer="below",
+        line_width=0,
+        annotation_text="Диапазон LRA",
+    )
+    fig.add_hline(
+        y=metrics.integrated_lufs,
+        line=dict(color="black", dash="dash"),
+        annotation_text="Integrated LUFS",
+        annotation_position="top left",
+    )
     fig.update_layout(
         title="Громкость во времени (LUFS)",
         xaxis_title="Время, с",
         yaxis_title="LUFS (дБ относительно полношкального сигнала)",
         template="plotly_white",
         legend_title="Окно расчёта",
+    )
+    return fig
+
+
+def build_lra_distribution_figure(metrics: LoudnessMetrics) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Histogram(
+            x=metrics.short_term_lufs,
+            name="Short-Term LUFS",
+            nbinsx=40,
+            marker_color="#1f77b4",
+        )
+    )
+    if np.isfinite(metrics.lra):
+        fig.add_vrect(
+            x0=np.nanmedian(metrics.short_term_lufs) - metrics.lra / 2,
+            x1=np.nanmedian(metrics.short_term_lufs) + metrics.lra / 2,
+            fillcolor="LightSkyBlue",
+            opacity=0.25,
+            line_width=0,
+            annotation_text="Диапазон LRA",
+        )
+    fig.add_vline(
+        x=metrics.integrated_lufs,
+        line=dict(color="black", dash="dash"),
+        annotation_text="Integrated",
+        annotation_position="top left",
+    )
+    fig.update_layout(
+        title="Распределение короткосрочной громкости (для расчёта LRA)",
+        xaxis_title="LUFS",
+        yaxis_title="Количество окон",
+        template="plotly_white",
     )
     return fig
 
@@ -311,10 +363,54 @@ def build_tempogram_figure(audio: np.ndarray, sr: int) -> go.Figure:
     return fig
 
 
+def build_beat_interval_figure(tempo: TempoMetrics) -> go.Figure:
+    fig = go.Figure()
+    if tempo.beat_times.size:
+        fig.add_trace(
+            go.Scatter(
+                x=tempo.beat_times,
+                y=np.pad(tempo.beat_intervals, (1, 0), constant_values=np.nan),
+                mode="lines+markers",
+                name="Интервалы между ударами",
+            )
+        )
+    fig.update_layout(
+        title="Стабильность темпа: интервалы между ударами",
+        xaxis_title="Время удара, с",
+        yaxis_title="Длительность интервала, с",
+        template="plotly_white",
+    )
+    return fig
+
+
+def build_percussive_ratio_figure(tempo: TempoMetrics) -> go.Figure:
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=["Весь ролик", "Хук 0–5 с"],
+                y=[
+                    tempo.percussive_ratio_overall * 100,
+                    tempo.percussive_ratio_hook * 100,
+                ],
+                marker_color=["#636efa", "#ef553b"],
+                texttemplate="%{y:.1f}%",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Доля перкуссивной энергии (HPSS)",
+        yaxis_title="Перкуссивная энергия, %",
+        template="plotly_white",
+    )
+    return fig
+
+
 def build_rms_figure(dynamics: DynamicsMetrics) -> go.Figure:
     fig = go.Figure(
         data=go.Scatter(x=dynamics.rms_times, y=dynamics.rms_dbfs, mode="lines", name="RMS")
     )
+    fig.add_vrect(x0=0, x1=5, fillcolor="LightGreen", opacity=0.15, line_width=0, annotation_text="Хук 0–5 с")
+    fig.add_vrect(x0=5, x1=15, fillcolor="LightBlue", opacity=0.1, line_width=0, annotation_text="Фон 5–15 с")
     fig.update_layout(
         title="Огибающая RMS (энергия сигнала во времени)",
         xaxis_title="Время, с",
@@ -330,7 +426,10 @@ def render_html(
     dynamics: DynamicsMetrics,
     waveform_fig: go.Figure,
     loudness_fig: go.Figure,
+    lra_fig: go.Figure,
     tempogram_fig: go.Figure,
+    beat_interval_fig: go.Figure,
+    percussive_ratio_fig: go.Figure,
     rms_fig: go.Figure,
     video_path: Path,
 ) -> str:
@@ -338,37 +437,60 @@ def render_html(
     body_sections: List[str] = [
         "<h1>Аналитический отчёт по аудиодорожке</h1>",
         f"<p><strong>Источник видео:</strong> {video_path}</p>",
-        "<p>Отчёт описывает громкость, темп и динамические контрасты аудио. Формулировки даны простым языком, чтобы даже без опыта в аудио было понятно, что означают показатели и как они связаны с восприятием.</p>",
-        "<h2>Быстрый обзор метрик</h2>",
-        "<ul>",
+        "<p>Отчёт собирает громкость, темп и динамические контрасты аудио. Все термины объяснены простым языком, чтобы читатель без опыта в звукотехнике понимал, что измерено и зачем.</p>",
+        "<h2>Краткая сводка чисел</h2>",
+        "<ul class=\"metric-list\">",
         f"<li><strong>Integrated Loudness (LUFS-I)</strong>: {format_metric(loudness.integrated_lufs, suffix=' LUFS')} — средняя воспринимаемая громкость всего ролика по стандарту ITU-R BS.1770 с K-взвешиванием.</li>",
-        f"<li><strong>Loudness Range (LRA)</strong>: {format_metric(loudness.lra, suffix=' LU')} — разброс короткосрочной громкости (между 10-м и 95-м перцентилями после гейтинга), отражает макро-контраст.</li>",
-        f"<li><strong>True Peak</strong>: {format_metric(loudness.true_peak_dbfs, suffix=' dBFS')} — максимальный пик после апсемплинга, важен для контроля клиппинга.</li>",
-        f"<li><strong>Crest Factor</strong>: {format_metric(loudness.crest_factor_db, suffix=' dB')} — разница между пиком и среднеквадратичным уровнем; показывает «ударность».</li>",
-        f"<li><strong>Hook Loudness Δ</strong>: {format_metric(loudness.hook_loudness_delta, suffix=' LU')} — насколько средняя громкость первых 5 секунд выше (или ниже) фона 5–15 с.</li>",
-        f"<li><strong>Темп</strong>: {format_metric(tempo.tempo_bpm, suffix=' BPM')} с уверенностью {format_metric(tempo.tempo_confidence * 100, precision=1, suffix='%')} — оценено по автокорреляции огибающей атак (onset envelope).</li>",
-        f"<li><strong>Percussive Ratio</strong>: {format_metric(tempo.percussive_ratio_overall * 100, precision=1, suffix='%')}(всего) / {format_metric(tempo.percussive_ratio_hook * 100, precision=1, suffix='%')} (хук) — доля энергии перкуссивной части после HPSS-разделения.</li>",
-        f"<li><strong>Onset Density</strong>: {format_metric(tempo.onset_density_hook, precision=2, suffix=' онсета/с')} в первых 5 с — частота «ударов»/атак, влияет на ощущение драйва.</li>",
-        f"<li><strong>Tempo Stability</strong>: {format_metric(tempo.tempo_stability, precision=3, suffix=' с')} — стандартное отклонение интервалов между ударами; чем меньше, тем ровнее пульс.</li>",
-        f"<li><strong>Transient Punch</strong>: {format_metric(dynamics.transient_punch_hook, suffix=' dB')} (0–5 с) / {format_metric(dynamics.transient_punch_body, suffix=' dB')} (5–15 с) — на сколько пиковые RMS-значения превышают типичные.</li>",
+        f"<li><strong>Loudness Range (LRA)</strong>: {format_metric(loudness.lra, suffix=' LU')} — разброс короткосрочной громкости (перцентиль 95 минус перцентиль 10 после гейтинга, то есть отсечения очень тихих фрагментов), показывает макро-контраст.</li>",
+        f"<li><strong>True Peak</strong>: {format_metric(loudness.true_peak_dbfs, suffix=' dBFS')} — максимум сигнала после апсемплинга, нужен, чтобы поймать междискретные пики и избежать клиппинга.</li>",
+        f"<li><strong>Crest Factor</strong>: {format_metric(loudness.crest_factor_db, suffix=' dB')} — разница между пиком и среднеквадратичным уровнем (RMS); характеризует «ударность».</li>",
+        f"<li><strong>Hook Loudness Δ</strong>: {format_metric(loudness.hook_loudness_delta, suffix=' LU')} — изменение громкости первых 5 с относительно участка 5–15 с (база).</li>",
+        f"<li><strong>Темп</strong>: {format_metric(tempo.tempo_bpm, suffix=' BPM')} с уверенностью {format_metric(tempo.tempo_confidence * 100, precision=1, suffix='%')} — найден по автокорреляции огибающей атак (onset envelope).</li>",
+        f"<li><strong>Percussive Ratio</strong>: {format_metric(tempo.percussive_ratio_overall * 100, precision=1, suffix='%')}(весь ролик) / {format_metric(tempo.percussive_ratio_hook * 100, precision=1, suffix='%')} (хук) — доля энергии ударных после HPSS-разделения.</li>",
+        f"<li><strong>Onset Density</strong>: {format_metric(tempo.onset_density_hook, precision=2, suffix=' онсета/с')} в 0–5 с — число атак в секунду, отражает насыщенность событий.</li>",
+        f"<li><strong>Tempo Stability</strong>: {format_metric(tempo.tempo_stability, precision=3, suffix=' с')} — стандартное отклонение интервалов между ударами (чем меньше, тем ровнее ритм).</li>",
+        f"<li><strong>Transient Punch</strong>: {format_metric(dynamics.transient_punch_hook, suffix=' dB')} (0–5 с) / {format_metric(dynamics.transient_punch_body, suffix=' dB')} (5–15 с) — насколько пики RMS выше типичных значений.</li>",
         "</ul>",
-        "<h2>Что означают эти показатели</h2>",
-        "<p><strong>LUFS</strong> — шкала, имитирующая человеческое восприятие громкости. Значения отрицательные: 0 LUFS соответствует максимально возможному уровню без искажений (0 dBFS). Integrated LUFS — усреднение по всему ролику; Short-Term (3 с) и Momentary (400 мс) показывают локальные изменения. LRA измеряет, насколько эти локальные значения разбросаны: низкий LRA — плоская динамика, высокий — есть контрасты.</p>",
-        "<p><strong>True Peak</strong> ищет пики после передискретизации: сигнал может клипповать выше 0 dBFS даже если отсчёты ниже. <strong>Crest Factor</strong> = Peak − RMS. Большой crest означает яркие удары поверх среднего уровня; слишком низкий crest фактор — признак сильной компрессии.</p>",
-        "<p><strong>Темп (BPM)</strong> оценивается по периодичности атак (onsets). <strong>Уверенность темпа</strong> — доля энергии главного пика темпограммы: если она низкая, пульс неустойчив или речь доминирует. <strong>Onset density</strong> — сколько атак в секунду, особенно в начале ролика; быстрый темп и частые атаки повышают возбуждение (arousal).</p>",
-        "<p><strong>Percussive Ratio</strong> после HPSS показывает, сколько энергии несут ударные по сравнению с гармоникой. В хуке рост этой доли часто добавляет «драйва». <strong>Tempo Stability</strong> (std интервалов между ударами) отражает ровность грува: меньше — стабильнее.</p>",
-        "<p><strong>Transient Punch</strong> сравнивает 95-й и 50-й процентили RMS: если разница большая, пики явно выделяются над средней энергией. Мы считаем отдельно для хука (0–5 с) и тела ролика (5–15 с), чтобы увидеть, есть ли дополнительный акцент в начале.</p>",
-        "<h2>Визуализации</h2>",
+        "<h2>Глоссарий простыми словами</h2>",
+        "<ul>",
+        "<li><strong>ITU-R BS.1770, K-взвешивание</strong> — международный способ считать воспринимаемую громкость: сначала фильтр, имитирующий чувствительность уха (K-weighting), затем энергия в окнах 400 мс суммируется по каналам.</li>",
+        "<li><strong>Гейтинг</strong> — отбрасываем слишком тихие фрагменты, чтобы они не занижали оценку. После этого считаем перцентили (10-й и 95-й) для LRA.</li>",
+        "<li><strong>Апсемплинг</strong> — временное повышение частоты дискретизации, чтобы заметить пики между исходными отсчётами. Так оценивается True Peak.</li>",
+        "<li><strong>Клиппинг</strong> — ситуация, когда сигнал выходит за 0 dBFS и искажается. True Peak помогает вовремя увидеть риск.</li>",
+        "<li><strong>Автокорреляция огибающей атак</strong> — поиск повторяющегося ритма по энергии ударов. Так оцениваем темп (BPM).</li>",
+        "<li><strong>HPSS</strong> — разделение сигнала на гармоническую (ноты, речь) и перкуссивную (удары) части; по перкуссивной считаем долю ударной энергии.</li>",
+        "</ul>",
+        "<h2>Почему уверенность темпа может быть 0%</h2>",
+        "<p>Уверенность = доля энергии главного пика темпограммы. Если её почти нет, значит сигнал неритмичный (например, речь, шум или очень короткий отрезок), и модель не видит устойчивого пульса. В таких случаях выводы по темпу лучше не использовать.</p>",
+        "<h2>Визуализации и как их читать</h2>",
+        "<h3>Форма волны</h3>",
+        "<p>Показывает амплитуду во времени — быстро видно тишину, всплески, монтажные стыки.</p>",
         waveform_fig.to_html(include_plotlyjs=False, full_html=False, div_id="waveform"),
+        "<h3>Громкость во времени (Momentary/Short-Term) с Integrated и LRA</h3>",
+        "<p>График объединяет мгновенную (400 мс) и короткосрочную (3 с) громкость. Пунктир — Integrated LUFS, голубая полоса — диапазон LRA. Если линия почти не выходит за полосу, динамика плоская; если гуляет, есть контрасты.</p>",
         loudness_fig.to_html(include_plotlyjs=False, full_html=False, div_id="loudness"),
+        "<h3>Распределение Short-Term LUFS (как набирается LRA)</h3>",
+        "<p>Гистограмма короткосрочной громкости с полосой LRA. Можно увидеть, есть ли много тихих/громких окон и насколько широко распределение.</p>",
+        lra_fig.to_html(include_plotlyjs=False, full_html=False, div_id="lra"),
+        "<h3>Темпограмма</h3>",
+        "<p>Тепловая карта возможных темпов во времени. Яркий вертикальный гребень = устойчивый темп. Если карта равномерная, уверенность низкая.</p>",
         tempogram_fig.to_html(include_plotlyjs=False, full_html=False, div_id="tempogram"),
+        "<h3>Стабильность темпа (интервалы между ударами)</h3>",
+        "<p>Линия показывает длительность промежутков между ударами. Чем ровнее линия, тем стабильнее пульс. Разброс интервалов увеличивает Tempo Stability.</p>",
+        beat_interval_fig.to_html(include_plotlyjs=False, full_html=False, div_id="beat-intervals"),
+        "<h3>Доля перкуссивной энергии (HPSS)</h3>",
+        "<p>Столбцы показывают, сколько энергии приходится на ударные во всём ролике и в хуке 0–5 с. Рост доли в начале обычно добавляет драйва.</p>",
+        percussive_ratio_fig.to_html(include_plotlyjs=False, full_html=False, div_id="percussive"),
+        "<h3>Огибающая RMS и Transient Punch</h3>",
+        "<p>RMS показывает среднюю энергию в окнах. Полосы выделяют хук (0–5 с) и базу (5–15 с) — по ним считаются Transient Punch и Hook Loudness Δ.</p>",
         rms_fig.to_html(include_plotlyjs=False, full_html=False, div_id="rms"),
-        "<h2>Практические выводы</h2>",
+        "<h2>Практические выводы по данным этого ролика</h2>",
         "<ol>",
-        "<li>Стриминги нормализуют интегральную громкость примерно до −14 LUFS. Поэтому ключевое — форма огибающей и микро-динамика: LRA, Crest, Hook Loudness Δ и Transient Punch.</li>",
-        "<li>Темп и перкуссивность работают только когда есть музыкальный материал. При низкой уверенности темпа (<50%) выводы делать осторожно.</li>",
-        "<li>Hook Loudness Δ > 0 и заметный Transient Punch в первых 5 с помогают привлечь внимание без необходимости «перекачивать» весь трек.</li>",
-        "<li>Оптимальный LRA контекст-зависим: слишком низкий утомляет, слишком высокий может отвлекать. Используйте показатель как гипотезу и калибруйте на своих метриках удержания.</li>",
+        f"<li>Integrated LUFS = {format_metric(loudness.integrated_lufs, suffix=' LUFS')}. На платформах громкость приведут к ≈ −14 LUFS, поэтому ценны контрасты: LRA = {format_metric(loudness.lra, suffix=' LU')} и Crest = {format_metric(loudness.crest_factor_db, suffix=' dB')} показывают, есть ли «дыхание» и удары.</li>",
+        f"<li>Hook Loudness Δ = {format_metric(loudness.hook_loudness_delta, suffix=' LU')}. Если показатель около нуля или ниже, можно усилить вовлечённость, слегка подняв громкость/динамику в первых секундах без увеличения интегрального уровня.</li>",
+        f"<li>Темп {format_metric(tempo.tempo_bpm, suffix=' BPM')} с уверенностью {format_metric(tempo.tempo_confidence * 100, precision=1, suffix='%')}. При низкой уверенности ритм неустойчив (часто из-за речи); для музыкального акцента стоит добавить явные удары или перкуссию.</li>",
+        f"<li>Percussive Ratio: {format_metric(tempo.percussive_ratio_hook * 100, precision=1, suffix='%')} в хуке. Если цель — драйв, можно усилить ударные или подчеркнуть атаки (увеличить Onset Density = {format_metric(tempo.onset_density_hook, precision=2, suffix=' онсета/с')}).</li>",
+        f"<li>Transient Punch: {format_metric(dynamics.transient_punch_hook, suffix=' dB')} в 0–5 с и {format_metric(dynamics.transient_punch_body, suffix=' dB')} в 5–15 с. Если значения малы, добавьте чуть больше атаки (эквалайзер/транзиент-шейпер) в ключевых моментах.</li>",
         "</ol>",
     ]
 
@@ -400,7 +522,10 @@ def generate_report(video_path: Path, output_html: Path) -> None:
 
     waveform_fig = build_waveform_figure(audio, sr)
     loudness_fig = build_loudness_figure(loudness)
+    lra_fig = build_lra_distribution_figure(loudness)
     tempogram_fig = build_tempogram_figure(audio, sr)
+    beat_interval_fig = build_beat_interval_figure(tempo)
+    percussive_ratio_fig = build_percussive_ratio_figure(tempo)
     rms_fig = build_rms_figure(dynamics)
 
     html = render_html(
@@ -409,7 +534,10 @@ def generate_report(video_path: Path, output_html: Path) -> None:
         dynamics=dynamics,
         waveform_fig=waveform_fig,
         loudness_fig=loudness_fig,
+        lra_fig=lra_fig,
         tempogram_fig=tempogram_fig,
+        beat_interval_fig=beat_interval_fig,
+        percussive_ratio_fig=percussive_ratio_fig,
         rms_fig=rms_fig,
         video_path=video_path,
     )
