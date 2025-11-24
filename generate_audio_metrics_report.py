@@ -103,7 +103,6 @@ def compute_loudness_metrics(audio: np.ndarray, sr: int) -> LoudnessMetrics:
         return np.array(centers), np.array(values)
 
     integrated_lufs = meter.integrated_loudness(audio)
-    lra = meter.loudness_range(audio)
     true_peak_dbfs = meter.true_peak(audio)
 
     rms_linear = np.sqrt(np.mean(np.square(audio)))
@@ -112,6 +111,20 @@ def compute_loudness_metrics(audio: np.ndarray, sr: int) -> LoudnessMetrics:
 
     short_term_times, short_term_lufs = _sliding_loudness(window_s=3.0, hop_s=0.5)
     momentary_times, momentary_lufs = _sliding_loudness(window_s=0.4, hop_s=0.1)
+
+    finite_short_term = short_term_lufs[np.isfinite(short_term_lufs)]
+    finite_short_term = finite_short_term[finite_short_term > -70]
+    if finite_short_term.size:
+        relative_gate = integrated_lufs - 20
+        gated = finite_short_term[finite_short_term > relative_gate]
+        if gated.size:
+            p10 = np.nanpercentile(gated, 10)
+            p95 = np.nanpercentile(gated, 95)
+            lra = float(p95 - p10)
+        else:
+            lra = float("nan")
+    else:
+        lra = float("nan")
 
     hook_mask = (short_term_times >= 0) & (short_term_times < 5)
     baseline_mask = (short_term_times >= 5) & (short_term_times < 15)
