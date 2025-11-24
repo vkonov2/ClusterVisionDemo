@@ -29,6 +29,7 @@ tensorflow-hub>=0.16.1
 librosa>=0.10.1
 soundfile>=0.12.1
 ffmpeg-python>=0.2.0
+pyloudnorm>=0.1.1
 
 # Для Wav2Vec2
 transformers>=4.41.0
