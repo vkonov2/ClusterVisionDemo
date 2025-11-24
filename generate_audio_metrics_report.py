@@ -335,22 +335,22 @@ def render_html(
     video_path: Path,
 ) -> str:
     plotly_js = "<script src=\"https://cdn.plot.ly/plotly-2.29.1.min.js\"></script>"
-    sections: List[str] = [
+    body_sections: List[str] = [
         "<h1>Аналитический отчёт по аудиодорожке</h1>",
         f"<p><strong>Источник видео:</strong> {video_path}</p>",
         "<p>Отчёт описывает громкость, темп и динамические контрасты аудио. Формулировки даны простым языком, чтобы даже без опыта в аудио было понятно, что означают показатели и как они связаны с восприятием.</p>",
         "<h2>Быстрый обзор метрик</h2>",
-        "<ul>"
-        f"<li><strong>Integrated Loudness (LUFS-I)</strong>: {format_metric(loudness.integrated_lufs, suffix=' LUFS')} — средняя воспринимаемая громкость всего ролика по стандарту ITU-R BS.1770 с K-взвешиванием.</li>"
-        f"<li><strong>Loudness Range (LRA)</strong>: {format_metric(loudness.lra, suffix=' LU')} — разброс короткосрочной громкости (между 10-м и 95-м перцентилями после гейтинга), отражает макро-контраст.</li>"
-        f"<li><strong>True Peak</strong>: {format_metric(loudness.true_peak_dbfs, suffix=' dBFS')} — максимальный пик после апсемплинга, важен для контроля клиппинга.</li>"
-        f"<li><strong>Crest Factor</strong>: {format_metric(loudness.crest_factor_db, suffix=' dB')} — разница между пиком и среднеквадратичным уровнем; показывает «ударность».</li>"
-        f"<li><strong>Hook Loudness Δ</strong>: {format_metric(loudness.hook_loudness_delta, suffix=' LU')} — насколько средняя громкость первых 5 секунд выше (или ниже) фона 5–15 с.</li>"
-        f"<li><strong>Темп</strong>: {format_metric(tempo.tempo_bpm, suffix=' BPM')} с уверенностью {format_metric(tempo.tempo_confidence * 100, precision=1, suffix='%')} — оценено по автокорреляции огибающей атак (onset envelope).</li>"
-        f"<li><strong>Percussive Ratio</strong>: {format_metric(tempo.percussive_ratio_overall * 100, precision=1, suffix='%')} (всего) / {format_metric(tempo.percussive_ratio_hook * 100, precision=1, suffix='%')} (хук) — доля энергии перкуссивной части после HPSS-разделения.</li>"
-        f"<li><strong>Onset Density</strong>: {format_metric(tempo.onset_density_hook, precision=2, suffix=' онсета/с')} в первых 5 с — частота «ударов»/атак, влияет на ощущение драйва.</li>"
-        f"<li><strong>Tempo Stability</strong>: {format_metric(tempo.tempo_stability, precision=3, suffix=' с')} — стандартное отклонение интервалов между ударами; чем меньше, тем ровнее пульс.</li>"
-        f"<li><strong>Transient Punch</strong>: {format_metric(dynamics.transient_punch_hook, suffix=' dB')} (0–5 с) / {format_metric(dynamics.transient_punch_body, suffix=' dB')} (5–15 с) — на сколько пиковые RMS-значения превышают типичные.</li>"
+        "<ul>",
+        f"<li><strong>Integrated Loudness (LUFS-I)</strong>: {format_metric(loudness.integrated_lufs, suffix=' LUFS')} — средняя воспринимаемая громкость всего ролика по стандарту ITU-R BS.1770 с K-взвешиванием.</li>",
+        f"<li><strong>Loudness Range (LRA)</strong>: {format_metric(loudness.lra, suffix=' LU')} — разброс короткосрочной громкости (между 10-м и 95-м перцентилями после гейтинга), отражает макро-контраст.</li>",
+        f"<li><strong>True Peak</strong>: {format_metric(loudness.true_peak_dbfs, suffix=' dBFS')} — максимальный пик после апсемплинга, важен для контроля клиппинга.</li>",
+        f"<li><strong>Crest Factor</strong>: {format_metric(loudness.crest_factor_db, suffix=' dB')} — разница между пиком и среднеквадратичным уровнем; показывает «ударность».</li>",
+        f"<li><strong>Hook Loudness Δ</strong>: {format_metric(loudness.hook_loudness_delta, suffix=' LU')} — насколько средняя громкость первых 5 секунд выше (или ниже) фона 5–15 с.</li>",
+        f"<li><strong>Темп</strong>: {format_metric(tempo.tempo_bpm, suffix=' BPM')} с уверенностью {format_metric(tempo.tempo_confidence * 100, precision=1, suffix='%')} — оценено по автокорреляции огибающей атак (onset envelope).</li>",
+        f"<li><strong>Percussive Ratio</strong>: {format_metric(tempo.percussive_ratio_overall * 100, precision=1, suffix='%')}(всего) / {format_metric(tempo.percussive_ratio_hook * 100, precision=1, suffix='%')} (хук) — доля энергии перкуссивной части после HPSS-разделения.</li>",
+        f"<li><strong>Onset Density</strong>: {format_metric(tempo.onset_density_hook, precision=2, suffix=' онсета/с')} в первых 5 с — частота «ударов»/атак, влияет на ощущение драйва.</li>",
+        f"<li><strong>Tempo Stability</strong>: {format_metric(tempo.tempo_stability, precision=3, suffix=' с')} — стандартное отклонение интервалов между ударами; чем меньше, тем ровнее пульс.</li>",
+        f"<li><strong>Transient Punch</strong>: {format_metric(dynamics.transient_punch_hook, suffix=' dB')} (0–5 с) / {format_metric(dynamics.transient_punch_body, suffix=' dB')} (5–15 с) — на сколько пиковые RMS-значения превышают типичные.</li>",
         "</ul>",
         "<h2>Что означают эти показатели</h2>",
         "<p><strong>LUFS</strong> — шкала, имитирующая человеческое восприятие громкости. Значения отрицательные: 0 LUFS соответствует максимально возможному уровню без искажений (0 dBFS). Integrated LUFS — усреднение по всему ролику; Short-Term (3 с) и Momentary (400 мс) показывают локальные изменения. LRA измеряет, насколько эти локальные значения разбросаны: низкий LRA — плоская динамика, высокий — есть контрасты.</p>",
@@ -364,16 +364,33 @@ def render_html(
         tempogram_fig.to_html(include_plotlyjs=False, full_html=False, div_id="tempogram"),
         rms_fig.to_html(include_plotlyjs=False, full_html=False, div_id="rms"),
         "<h2>Практические выводы</h2>",
-        "<ol>"
-        "<li>Стриминги нормализуют интегральную громкость примерно до −14 LUFS. Поэтому ключевое — форма огибающей и микро-динамика: LRA, Crest, Hook Loudness Δ и Transient Punch.</li>"
-        "<li>Темп и перкуссивность работают только когда есть музыкальный материал. При низкой уверенности темпа (<50%) выводы делать осторожно.</li>"
-        "<li>Hook Loudness Δ > 0 и заметный Transient Punch в первых 5 с помогают привлечь внимание без необходимости «перекачивать» весь трек.</li>"
-        "<li>Оптимальный LRA контекст-зависим: слишком низкий утомляет, слишком высокий может отвлекать. Используйте показатель как гипотезу и калибруйте на своих метриках удержания.</li>"
+        "<ol>",
+        "<li>Стриминги нормализуют интегральную громкость примерно до −14 LUFS. Поэтому ключевое — форма огибающей и микро-динамика: LRA, Crest, Hook Loudness Δ и Transient Punch.</li>",
+        "<li>Темп и перкуссивность работают только когда есть музыкальный материал. При низкой уверенности темпа (<50%) выводы делать осторожно.</li>",
+        "<li>Hook Loudness Δ > 0 и заметный Transient Punch в первых 5 с помогают привлечь внимание без необходимости «перекачивать» весь трек.</li>",
+        "<li>Оптимальный LRA контекст-зависим: слишком низкий утомляет, слишком высокий может отвлекать. Используйте показатель как гипотезу и калибруйте на своих метриках удержания.</li>",
         "</ol>",
     ]
 
-    return "\n".join([plotly_js] + sections)
+    body_html = "\n".join(body_sections)
 
+    return "\n".join(
+        [
+            "<!DOCTYPE html>",
+            '<html lang="ru">',
+            "<head>",
+            "<meta charset=\"UTF-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            "<title>Аналитический отчёт по аудиодорожке</title>",
+            "<style>body{font-family:Arial,sans-serif;line-height:1.6;margin:24px;} h1,h2{color:#222;} ul,ol{margin-left:20px;} figure{margin:0 0 24px 0;} iframe{width:100%;} .metric-list li{margin-bottom:6px;}</style>",
+            plotly_js,
+            "</head>",
+            "<body>",
+            body_html,
+            "</body>",
+            "</html>",
+        ]
+    )
 
 def generate_report(video_path: Path, output_html: Path) -> None:
     audio, sr = extract_audio(video_path)
