@@ -19,6 +19,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.utils import PlotlyJSONEncoder
+from tqdm import tqdm
 
 
 @dataclass
@@ -371,7 +372,82 @@ def make_frame_pairs(frames: List[np.ndarray]) -> List[dict]:
     return pairs
 
 
-def generate_report(metrics: MotionMetrics, frames: List[np.ndarray], video_path: Path, output_html: Path) -> None:
+def plot_flow_heatmap_sequence(flows: List[np.ndarray], fps: float) -> go.Figure:
+    if not flows:
+        raise ValueError("Нет данных оптического потока для построения тепловых карт")
+
+    mags = [np.linalg.norm(flow, axis=2) for flow in flows]
+    base_mag = mags[0]
+    times = np.arange(len(flows)) / (fps or 1.0)
+
+    frames = [
+        go.Frame(
+            data=[go.Heatmap(z=mag, colorscale="Turbo", showscale=False)],
+            name=str(idx),
+        )
+        for idx, mag in enumerate(mags)
+    ]
+
+    slider_steps = [
+        {
+            "label": f"{idx} ({t:.2f} с)",
+            "method": "animate",
+            "args": [[str(idx)], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
+            "value": idx,
+        }
+        for idx, t in enumerate(times)
+    ]
+
+    fig = go.Figure(
+        data=[go.Heatmap(z=base_mag, colorscale="Turbo", colorbar_title="|F|, пикс/кадр")],
+        frames=frames,
+    )
+    fig.update_layout(
+        title="Поштучные тепловые карты оптического потока",
+        width=720,
+        height=405,
+        xaxis=dict(title="Ширина (пиксели)", visible=False),
+        yaxis=dict(title="Высота (пиксели)", scaleanchor="x", scaleratio=1, visible=False),
+        sliders=[
+            {
+                "active": 0,
+                "currentvalue": {"prefix": "Пара кадров: "},
+                "steps": slider_steps,
+                "pad": {"l": 30, "r": 30, "t": 25, "b": 10},
+            }
+        ],
+        updatemenus=[
+            {
+                "type": "buttons",
+                "buttons": [
+                    {
+                        "label": "▶️",
+                        "method": "animate",
+                        "args": [None, {"frame": {"duration": 300, "redraw": True}, "fromcurrent": True}],
+                    },
+                    {
+                        "label": "⏸️",
+                        "method": "animate",
+                        "args": [[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}],
+                    },
+                ],
+                "pad": {"l": 30, "r": 30, "t": 0, "b": 0},
+                "showactive": False,
+            }
+        ],
+        template="plotly_white",
+    )
+    return fig
+
+
+def generate_report(
+    metrics: MotionMetrics,
+    flows: List[np.ndarray],
+    frames: List[np.ndarray],
+    fps: float,
+    video_path: Path,
+    output_html: Path,
+) -> None:
     output_html.parent.mkdir(parents=True, exist_ok=True)
 
     fig_timeline = plot_motion_timeline(metrics)
@@ -379,6 +455,7 @@ def generate_report(metrics: MotionMetrics, frames: List[np.ndarray], video_path
     fig_accel = plot_acceleration(metrics)
     fig_decomp = plot_camera_vs_object(metrics)
     fig_saliency = plot_saliency_map(metrics)
+    fig_heatmaps = plot_flow_heatmap_sequence(flows, fps=fps)
 
     mean_motion = float(np.nanmean(metrics.mean_motion))
     p95_motion = float(np.nanmean(metrics.p95_motion))
@@ -392,6 +469,7 @@ def generate_report(metrics: MotionMetrics, frames: List[np.ndarray], video_path
     accel_json = json.dumps(fig_accel, cls=PlotlyJSONEncoder)
     decomp_json = json.dumps(fig_decomp, cls=PlotlyJSONEncoder)
     saliency_json = json.dumps(fig_saliency, cls=PlotlyJSONEncoder)
+    heatmap_json = json.dumps(fig_heatmaps, cls=PlotlyJSONEncoder)
     frames_json = json.dumps(frame_pairs)
 
     html = f"""<!DOCTYPE html>
@@ -406,9 +484,10 @@ def generate_report(metrics: MotionMetrics, frames: List[np.ndarray], video_path
     h3 {{ margin-top: 1.1em; }}
     .metric {{ background:#f5f7fb; padding:12px 16px; border-radius:8px; margin:6px 0; }}
     .frame-pair {{ display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0 32px; align-items: flex-start; }}
-    .frame-pair img {{ width: 240px; max-width: 100%; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.08); background: #111; object-fit: contain; }}
+    .frame-pair img {{ width: 200px; max-width: 100%; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.08); background: #111; object-fit: contain; }}
     .frame-caption {{ font-size: 14px; color: #444; margin: 4px 0 0 0; }}
     #fig-saliency {{ max-width: 760px; margin: 0 auto; }}
+    #fig-heatmaps {{ max-width: 760px; margin: 0 auto; }}
   </style>
 </head>
 <body>
@@ -484,12 +563,27 @@ def generate_report(metrics: MotionMetrics, frames: List[np.ndarray], video_path
 <p>Более детализированная тепловая карта (16×9 ячеек): где остаточный поток (движение объектов) максимален. Эти зоны естественно притягивают взгляд.</p>
 <div id=\"fig-saliency\"></div>
 
+<h3>6. Тепловые карты потока по каждой паре кадров</h3>
+<p>Каждый слайд показывает тепловую карту модуля оптического потока для соседних кадров. Цвет = скорость пикселей; листайте ползунком или используйте Play/Пауза. Ниже — кадры t и t+1 для выбранной позиции.</p>
+<div id=\"fig-heatmaps\"></div>
+<div class=\"frame-pair\">
+  <div>
+    <img id=\"heatmap-prev\" alt=\"Кадр t\" />
+    <div class=\"frame-caption\">Кадр t</div>
+  </div>
+  <div>
+    <img id=\"heatmap-next\" alt=\"Кадр t+1\" />
+    <div class=\"frame-caption\">Кадр t+1</div>
+  </div>
+</div>
+
 <script>
   const timelineFig = {timeline_json};
   const entropyFig = {entropy_json};
   const accelFig = {accel_json};
   const decompFig = {decomp_json};
   const saliencyFig = {saliency_json};
+  const heatmapFig = {heatmap_json};
   const framePairs = {frames_json};
 
   Plotly.newPlot('fig-timeline', timelineFig.data, timelineFig.layout);
@@ -497,8 +591,9 @@ def generate_report(metrics: MotionMetrics, frames: List[np.ndarray], video_path
   Plotly.newPlot('fig-accel', accelFig.data, accelFig.layout);
   Plotly.newPlot('fig-decomp', decompFig.data, decompFig.layout);
   Plotly.newPlot('fig-saliency', saliencyFig.data, saliencyFig.layout);
+  Plotly.newPlot('fig-heatmaps', heatmapFig.data, heatmapFig.layout).then((g) => Plotly.addFrames(g, heatmapFig.frames));
 
-  function attachFramePreview(divId, prevId, nextId) {{
+  function attachFramePreview(divId, prevId, nextId, useSlider = false) {{
     const div = document.getElementById(divId);
     const prevImg = document.getElementById(prevId);
     const nextImg = document.getElementById(nextId);
@@ -516,12 +611,26 @@ def generate_report(metrics: MotionMetrics, frames: List[np.ndarray], video_path
     setFromIndex(0);
     div.on('plotly_hover', (ev) => {{ const idx = ev?.points?.[0]?.pointIndex; setFromIndex(idx); }});
     div.on('plotly_click', (ev) => {{ const idx = ev?.points?.[0]?.pointIndex; setFromIndex(idx); }});
+    if (useSlider) {{
+      div.on('plotly_sliderchange', (ev) => {{
+        const raw = ev?.step?.value ?? ev?.step?.label;
+        if (raw === undefined) return;
+        const idx = parseInt(String(raw).split(' ')[0], 10);
+        if (!Number.isNaN(idx)) setFromIndex(idx);
+      }});
+      div.on('plotly_animated', (ev) => {{
+        const name = ev?.name;
+        const idx = parseInt(name, 10);
+        if (!Number.isNaN(idx)) setFromIndex(idx);
+      }});
+    }}
   }}
 
   attachFramePreview('fig-timeline', 'timeline-prev', 'timeline-next');
   attachFramePreview('fig-entropy', 'entropy-prev', 'entropy-next');
   attachFramePreview('fig-accel', 'accel-prev', 'accel-next');
   attachFramePreview('fig-decomp', 'decomp-prev', 'decomp-next');
+  attachFramePreview('fig-heatmaps', 'heatmap-prev', 'heatmap-next', true);
 </script>
 
 </body>
@@ -547,12 +656,19 @@ def show_interactive_plots(metrics: MotionMetrics) -> None:
 
 
 def main() -> None:
-    args = parse_args()
-    frames, fps = read_and_resample_video(args.video_path, args.target_fps, args.width, args.height)
-    flows, _ = compute_dense_flow(frames)
-    metrics = aggregate_motion_metrics(flows, fps, grid_size=(16, 9))
-    generate_report(metrics, frames, args.video_path, args.output_html)
-    print(f"Готово: отчёт сохранён в {args.output_html}")
+    video_paths = sorted(Path("data/videos").glob("*.mp4"))
+    for video_path in tqdm(video_paths[:10], desc="Generating optical flow reports", unit="video"):
+        args = argparse.Namespace(
+            video_path=video_path,
+            target_fps=25,
+            width=512,
+            height=288,
+            output_html=Path(f"outputs/optical_flow/{video_path.stem}.html"),
+        )
+        frames, fps = read_and_resample_video(args.video_path, args.target_fps, args.width, args.height)
+        flows, _ = compute_dense_flow(frames)
+        metrics = aggregate_motion_metrics(flows, fps, grid_size=(16, 9))
+        generate_report(metrics, flows, frames, fps, args.video_path, args.output_html)
 
 
 if __name__ == "__main__":
