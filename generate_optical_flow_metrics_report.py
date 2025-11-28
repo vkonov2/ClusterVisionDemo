@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import List, Tuple
 
 import cv2
 import numpy as np
 import plotly.graph_objects as go
+from plotly.utils import PlotlyJSONEncoder
 
 
 @dataclass
@@ -357,9 +359,9 @@ def generate_report(metrics: MotionMetrics, video_path: Path, output_html: Path)
   <h2>Сводные числовые показатели</h2>
   <div class=\"grid\">
     <div class=\"metric\">Средний модуль потока (медиана по роликам): <strong>{mean_motion:.3f}</strong> пикс/кадр</div>
-    <div class=\"metric\">95-й перцентиль модуля: <strong>{p95_motion:.3f}</strong> пикс/кадр</div>
-    <div class=\"metric\">Энтропия направлений (средняя): <strong>{entropy:.3f}</strong> бит</div>
-    <div class=\"metric\">Соотношение объектов/камеры по энергии: <strong>{ratio:.2f}×</strong></div>
+    <div class=\"metric\">95-й перцентиль модуля: <strong>{p95_motion:.3f}</strong> пикс/кадр — значение, которое превышает только 5% самых быстрых пикселей; показывает редкие всплески движения.</div>
+    <div class=\"metric\">Энтропия направлений (средняя): <strong>{entropy:.3f}</strong> бит — хаотичность направлений: 0 бит = весь поток в одну сторону, ~π-бит и выше = движение размазано по углам.</div>
+    <div class=\"metric\">Соотношение объектов/камеры по энергии: <strong>{ratio:.2f}×</strong> — насколько сильнее движутся объекты, чем камера (1× = равно; &gt;1× = объекты доминируют).</div>
   </div>
 
   <h2>Как читать графики</h2>
@@ -390,13 +392,17 @@ def generate_report(metrics: MotionMetrics, video_path: Path, output_html: Path)
         )
     ]
 
+    def to_json(obj: go.Figure) -> str:
+        return json.dumps(obj, cls=PlotlyJSONEncoder)
+
     parts.append(
-        f"<script>Plotly.newPlot('timeline', {fig_timeline.to_json()});"  # type: ignore[str-format]
-        f"Plotly.newPlot('entropy', {fig_entropy.to_json()});"
-        f"Plotly.newPlot('accel', {fig_accel.to_json()});"
-        f"Plotly.newPlot('decomp', {fig_decomp.to_json()});"
-        f"Plotly.newPlot('saliency', {fig_saliency.to_json()});"  # noqa: E501
-        "</script>"
+        "<script>"
+        + f"Plotly.newPlot('timeline', {to_json(fig_timeline)});"
+        + f"Plotly.newPlot('entropy', {to_json(fig_entropy)});"
+        + f"Plotly.newPlot('accel', {to_json(fig_accel)});"
+        + f"Plotly.newPlot('decomp', {to_json(fig_decomp)});"
+        + f"Plotly.newPlot('saliency', {to_json(fig_saliency)});"
+        + "</script>"
     )
 
     output_html.write_text("\n".join(parts), encoding="utf-8")
