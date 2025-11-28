@@ -392,16 +392,27 @@ def generate_report(metrics: MotionMetrics, video_path: Path, output_html: Path)
         )
     ]
 
-    def to_json(obj: go.Figure) -> str:
+    def to_json_obj(obj: go.Figure) -> str:
         return json.dumps(obj, cls=PlotlyJSONEncoder)
 
     parts.append(
         "<script>"
-        + f"Plotly.newPlot('timeline', {to_json(fig_timeline)});"
-        + f"Plotly.newPlot('entropy', {to_json(fig_entropy)});"
-        + f"Plotly.newPlot('accel', {to_json(fig_accel)});"
-        + f"Plotly.newPlot('decomp', {to_json(fig_decomp)});"
-        + f"Plotly.newPlot('saliency', {to_json(fig_saliency)});"
+        + "const timelineFig = "
+        + to_json_obj(fig_timeline)
+        + ";const entropyFig = "
+        + to_json_obj(fig_entropy)
+        + ";const accelFig = "
+        + to_json_obj(fig_accel)
+        + ";const decompFig = "
+        + to_json_obj(fig_decomp)
+        + ";const saliencyFig = "
+        + to_json_obj(fig_saliency)
+        + ";"
+        + "Plotly.newPlot('timeline', timelineFig.data, timelineFig.layout);"
+        + "Plotly.newPlot('entropy', entropyFig.data, entropyFig.layout);"
+        + "Plotly.newPlot('accel', accelFig.data, accelFig.layout);"
+        + "Plotly.newPlot('decomp', decompFig.data, decompFig.layout);"
+        + "Plotly.newPlot('saliency', saliencyFig.data, saliencyFig.layout);"
         + "</script>"
     )
 
