@@ -8,6 +8,7 @@ visualizations.
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import List, Tuple
 import cv2
 import numpy as np
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.utils import PlotlyJSONEncoder
 
 
@@ -142,9 +144,9 @@ def decompose_camera_motion(flow: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     pts1 = (pts0 + flow.reshape(-1, 2)).astype(np.float32)
 
     try:
-        M, inliers = cv2.estimateAffine2D(pts0, pts1, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+        M, _ = cv2.estimateAffine2D(pts0, pts1, method=cv2.RANSAC, ransacReprojThreshold=3.0)
     except Exception:
-        M, inliers = None, None
+        M = None
 
     if M is None:
         return np.zeros_like(flow), flow
@@ -174,7 +176,7 @@ def entropy_of_flow(flow: np.ndarray) -> float:
 
 
 def aggregate_motion_metrics(
-    flows: List[np.ndarray], fps: float, grid_size: Tuple[int, int] = (8, 8)
+    flows: List[np.ndarray], fps: float, grid_size: Tuple[int, int] = (16, 9)
 ) -> MotionMetrics:
     fps = fps or 1.0
 
@@ -204,7 +206,6 @@ def aggregate_motion_metrics(
 
     residual_ratio = float(np.mean(residual_energy) / (np.mean(camera_energy) + 1e-9))
 
-    # Saliency map: average residual magnitude per grid cell across frames
     h, w = flows[0].shape[:2]
     grid_h, grid_w = grid_size
     saliency = np.zeros((grid_h, grid_w))
@@ -240,36 +241,66 @@ def aggregate_motion_metrics(
 
 def plot_motion_timeline(metrics: MotionMetrics) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=metrics.times, y=metrics.mean_motion, name="Mean |F|", mode="lines"))
-    fig.add_trace(go.Scatter(x=metrics.times, y=metrics.p95_motion, name="95-перц. |F|", mode="lines"))
+    fig.add_trace(
+        go.Scatter(
+            x=metrics.times.tolist(),
+            y=metrics.mean_motion.tolist(),
+            name="Mean |F|",
+            mode="lines",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=metrics.times.tolist(),
+            y=metrics.p95_motion.tolist(),
+            name="95-перц. |F|",
+            mode="lines",
+        )
+    )
     fig.update_layout(
         title="Профиль движения: средний и 95-й перцентиль модуля потока",
         xaxis_title="Время, с",
         yaxis_title="Пикселей/кадр",
         hovermode="x unified",
+        template="plotly_white",
     )
     return fig
 
 
 def plot_entropy(metrics: MotionMetrics) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=metrics.times, y=metrics.entropy, mode="lines", name="Энтропия направлений"))
+    fig.add_trace(
+        go.Scatter(
+            x=metrics.times.tolist(),
+            y=metrics.entropy.tolist(),
+            mode="lines",
+            name="Энтропия направлений",
+        )
+    )
     fig.update_layout(
         title="Хаотичность движения (энтропия направлений)",
         xaxis_title="Время, с",
         yaxis_title="Энтропия, бит",
         hovermode="x unified",
+        template="plotly_white",
     )
     return fig
 
 
 def plot_acceleration(metrics: MotionMetrics) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=metrics.times, y=metrics.acceleration, name="Δ mean |F|"))
+    fig.add_trace(
+        go.Bar(
+            x=metrics.times.tolist(),
+            y=metrics.acceleration.tolist(),
+            name="Δ mean |F|",
+        )
+    )
     fig.update_layout(
         title="Ускорение/рывки движения (кадр-кадр)",
         xaxis_title="Время, с",
         yaxis_title="Изменение mean |F|",
+        template="plotly_white",
     )
     return fig
 
@@ -278,16 +309,16 @@ def plot_camera_vs_object(metrics: MotionMetrics) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
-            x=metrics.times,
-            y=metrics.camera_energy,
+            x=metrics.times.tolist(),
+            y=metrics.camera_energy.tolist(),
             name="Движение камеры",
             mode="lines",
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=metrics.times,
-            y=metrics.residual_energy,
+            x=metrics.times.tolist(),
+            y=metrics.residual_energy.tolist(),
             name="Движение объектов",
             mode="lines",
         )
@@ -297,6 +328,7 @@ def plot_camera_vs_object(metrics: MotionMetrics) -> go.Figure:
         xaxis_title="Время, с",
         yaxis_title="Средний модуль потока",
         hovermode="x unified",
+        template="plotly_white",
     )
     return fig
 
@@ -305,8 +337,8 @@ def plot_saliency_map(metrics: MotionMetrics) -> go.Figure:
     fig = go.Figure(
         data=go.Heatmap(
             z=metrics.saliency_map,
-            x=metrics.grid_x,
-            y=metrics.grid_y,
+            x=metrics.grid_x.tolist(),
+            y=metrics.grid_y.tolist(),
             colorscale="Turbo",
             colorbar_title="Средний |F|",
         )
@@ -315,11 +347,28 @@ def plot_saliency_map(metrics: MotionMetrics) -> go.Figure:
         title="Карта motion-saliency (остаточный поток объектов)",
         xaxis_title="Нормированная ширина",
         yaxis_title="Нормированная высота",
+        template="plotly_white",
     )
     return fig
 
 
-def generate_report(metrics: MotionMetrics, video_path: Path, output_html: Path) -> None:
+def encode_frame(frame: np.ndarray) -> str:
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    success, buffer = cv2.imencode(".jpg", rgb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not success:
+        raise RuntimeError("Не удалось закодировать кадр в JPEG")
+    b64 = base64.b64encode(buffer).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def make_frame_pairs(frames: List[np.ndarray]) -> List[dict]:
+    pairs = []
+    for idx in range(len(frames) - 1):
+        pairs.append({"prev": encode_frame(frames[idx]), "next": encode_frame(frames[idx + 1])})
+    return pairs
+
+
+def generate_report(metrics: MotionMetrics, frames: List[np.ndarray], video_path: Path, output_html: Path) -> None:
     output_html.parent.mkdir(parents=True, exist_ok=True)
 
     fig_timeline = plot_motion_timeline(metrics)
@@ -328,103 +377,177 @@ def generate_report(metrics: MotionMetrics, video_path: Path, output_html: Path)
     fig_decomp = plot_camera_vs_object(metrics)
     fig_saliency = plot_saliency_map(metrics)
 
-    parts = [
-        """<!DOCTYPE html>
+    mean_motion = float(np.nanmean(metrics.mean_motion))
+    p95_motion = float(np.nanmean(metrics.p95_motion))
+    entropy_mean = float(np.nanmean(metrics.entropy))
+    ratio = float(metrics.residual_ratio)
+
+    frame_pairs = make_frame_pairs(frames)
+
+    timeline_json = json.dumps(fig_timeline, cls=PlotlyJSONEncoder)
+    entropy_json = json.dumps(fig_entropy, cls=PlotlyJSONEncoder)
+    accel_json = json.dumps(fig_accel, cls=PlotlyJSONEncoder)
+    decomp_json = json.dumps(fig_decomp, cls=PlotlyJSONEncoder)
+    saliency_json = json.dumps(fig_saliency, cls=PlotlyJSONEncoder)
+    frames_json = json.dumps(frame_pairs)
+
+    html = f"""<!DOCTYPE html>
 <html lang=\"ru\">
 <head>
   <meta charset=\"UTF-8\" />
-  <title>Оптический поток — аналитический отчёт</title>
-  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <title>Аналитический отчёт по оптическому потоку</title>
+  <script src=\"https://cdn.plot.ly/plotly-2.29.1.min.js\"></script>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.55; margin: 32px; }}
-    h1, h2, h3 {{ margin-top: 1.2em; }}
-    .metric {{ background: #f5f7fb; padding: 12px 16px; border-radius: 8px; margin: 8px 0; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }}
-    .code {{ font-family: 'SFMono-Regular', Consolas, monospace; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 32px; line-height: 1.55; }}
+    h2 {{ margin-top: 1.4em; }}
+    h3 {{ margin-top: 1.1em; }}
+    .metric {{ background:#f5f7fb; padding:12px 16px; border-radius:8px; margin:6px 0; }}
+    .frame-pair {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin: 12px 0 32px; align-items: start; }}
+    .frame-pair img {{ width: 100%; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.08); background: #111; }}
+    .frame-caption {{ font-size: 14px; color: #444; margin: 4px 0 0 0; }}
   </style>
 </head>
 <body>
-  <h1>Аналитический отчёт по оптическому потоку</h1>
-  <p>Видео: <strong>{video}</strong>. Оптический поток описывает, как смещаются пиксели между соседними кадрами: каждому пикселю соответствует вектор (δx, δy). Мы используем плотный поток TV-L1 (при наличии) либо Farnebäck, нормализуем частоту до целевого FPS и декомпозируем движение на вклад камеры и объектов.</p>
 
-  <h2>Краткие определения (простым языком)</h2>
-  <ul>
-    <li><strong>Оптический поток</strong> — поле векторов смещения между кадрами. Модуль |F| показывает скорость пикселя, угол — направление.</li>
-    <li><strong>TV-L1 / Farnebäck</strong> — алгоритмы для оценки потока: TV-L1 устойчив к шуму и резким границам, Farnebäck — быстрый классический метод.</li>
-    <li><strong>Декомпозиция камеры</strong> — фитим аффинную модель (смещение+масштаб+поворот) по всему полю. То, что хорошо объясняется моделью, считаем движением камеры; остаток — движение объектов.</li>
-    <li><strong>Энтропия направлений</strong> — мера хаотичности: если движение разбросано по всем углам, энтропия выше.</li>
-    <li><strong>Motion saliency</strong> — карта, где остаточный поток (объекты) максимален; туда естественно тянется взгляд.</li>
-  </ul>
+<h1>Аналитический отчёт по оптическому потоку</h1>
+<p>Видео: <strong>{video_path}</strong>. Оптический поток описывает, как смещаются пиксели между соседними кадрами: каждому пикселю соответствует вектор (δx, δy). Мы нормализуем fps, считаем плотный поток (TV-L1 если доступен, иначе Farnebäck), отделяем движение камеры (аффинная модель) от движения объектов и строим интерактивные графики.</p>
 
-  <h2>Сводные числовые показатели</h2>
-  <div class=\"grid\">
-    <div class=\"metric\">Средний модуль потока (медиана по роликам): <strong>{mean_motion:.3f}</strong> пикс/кадр</div>
-    <div class=\"metric\">95-й перцентиль модуля: <strong>{p95_motion:.3f}</strong> пикс/кадр — значение, которое превышает только 5% самых быстрых пикселей; показывает редкие всплески движения.</div>
-    <div class=\"metric\">Энтропия направлений (средняя): <strong>{entropy:.3f}</strong> бит — хаотичность направлений: 0 бит = весь поток в одну сторону, ~π-бит и выше = движение размазано по углам.</div>
-    <div class=\"metric\">Соотношение объектов/камеры по энергии: <strong>{ratio:.2f}×</strong> — насколько сильнее движутся объекты, чем камера (1× = равно; &gt;1× = объекты доминируют).</div>
+<h2>Сводные показатели</h2>
+<div class=\"metric\">Средний модуль потока: <strong>{mean_motion:.3f}</strong> пикс/кадр</div>
+<div class=\"metric\">95-й перцентиль: <strong>{p95_motion:.3f}</strong> пикс/кадр — значение, которое превышает только 5% самых быстрых пикселей; фиксирует всплески движения.</div>
+<div class=\"metric\">Средняя энтропия направлений: <strong>{entropy_mean:.3f}</strong> бит — 0 бит = все движения в одну сторону, выше → хаос направлений.</div>
+<div class=\"metric\">Соотношение объектов/камеры: <strong>{ratio:.2f}×</strong> — насколько энергия движения объектов выше энергии движения камеры (&gt;1× = объекты доминируют).</div>
+
+<h2>Графики и кадры</h2>
+
+<h3>1. Профиль движения</h3>
+<p>График показывает, как меняется средний модуль потока и 95-й перцентиль (вспышки). Ниже — пара кадров для выбранной точки на графике: слева кадр t, справа t+1.</p>
+<div id=\"fig-timeline\"></div>
+<div class=\"frame-pair\">
+  <div>
+    <img id=\"timeline-prev\" alt=\"Кадр t\" />
+    <div class=\"frame-caption\">Кадр t</div>
   </div>
+  <div>
+    <img id=\"timeline-next\" alt=\"Кадр t+1\" />
+    <div class=\"frame-caption\">Кадр t+1</div>
+  </div>
+</div>
 
-  <h2>Как читать графики</h2>
-  <p><strong>Профиль движения</strong>: средний и 95-й перцентиль |F| показывают базовый уровень и вспышки движения. <strong>Энтропия</strong> — насколько направления хаотичны (хаос = реклама «дергается»). <strong>Ускорение</strong> ловит рывки (внезапные смены). <strong>Декомпозиция</strong> отделяет «камера едет» от «объекты двигаются». <strong>Карта saliency</strong> подсвечивает зоны, где объекты двигаются сильнее всего.</p>
+<h3>2. Энтропия направлений</h3>
+<p>Отражает хаотичность движения: низко = движение преимущественно в одном направлении; высоко = дергание/разброс по всем углам.</p>
+<div id=\"fig-entropy\"></div>
+<div class=\"frame-pair\">
+  <div>
+    <img id=\"entropy-prev\" alt=\"Кадр t\" />
+    <div class=\"frame-caption\">Кадр t</div>
+  </div>
+  <div>
+    <img id=\"entropy-next\" alt=\"Кадр t+1\" />
+    <div class=\"frame-caption\">Кадр t+1</div>
+  </div>
+</div>
 
-  <h2>Графики</h2>
-  <div id=\"timeline\"></div>
-  <div id=\"entropy\"></div>
-  <div id=\"accel\"></div>
-  <div id=\"decomp\"></div>
-  <div id=\"saliency\"></div>
+<h3>3. Ускорение движения</h3>
+<p>Δ mean|F| кадр-к-кадру. Пики показывают рывки — смены планов, внезапное появление объектов. Кадры ниже обновляются при наведении/клике на столбец.</p>
+<div id=\"fig-accel\"></div>
+<div class=\"frame-pair\">
+  <div>
+    <img id=\"accel-prev\" alt=\"Кадр t\" />
+    <div class=\"frame-caption\">Кадр t</div>
+  </div>
+  <div>
+    <img id=\"accel-next\" alt=\"Кадр t+1\" />
+    <div class=\"frame-caption\">Кадр t+1</div>
+  </div>
+</div>
 
-  <h2>Практические выводы</h2>
-  <ul>
-    <li>Если вклад камеры высок и остаток малый — кадр плавный, внимание нужно поддерживать другими каналами (лицо/текст/звук).</li>
-    <li>Высокий 95-й перцентиль или ускорение — вспышки движения, которые можно синхронизировать с появлением бренда/CTA.</li>
-    <li>Зоны высокой motion-saliency подскажут, где разместить ключевой объект, чтобы совпасть с естественным сдвигом взгляда.</li>
-    <li>Избыточная энтропия направлений = хаотичное дергание; это может перегружать зрителя.</li>
-  </ul>
+<h3>4. Движение камеры vs объектов</h3>
+<p>Аффинная модель описывает движение камеры; остаток — движение объектов. Если объектная кривая выше, внимание зрителя скорее цепляется за движущиеся элементы кадра, а не за панораму/зум камеры.</p>
+<div id=\"fig-decomp\"></div>
+<div class=\"frame-pair\">
+  <div>
+    <img id=\"decomp-prev\" alt=\"Кадр t\" />
+    <div class=\"frame-caption\">Кадр t</div>
+  </div>
+  <div>
+    <img id=\"decomp-next\" alt=\"Кадр t+1\" />
+    <div class=\"frame-caption\">Кадр t+1</div>
+  </div>
+</div>
+
+<h3>5. Карта motion-saliency</h3>
+<p>Более детализированная тепловая карта (16×9 ячеек): где остаточный поток (движение объектов) максимален. Эти зоны естественно притягивают взгляд.</p>
+<div id=\"fig-saliency\"></div>
+
+<script>
+  const timelineFig = {timeline_json};
+  const entropyFig = {entropy_json};
+  const accelFig = {accel_json};
+  const decompFig = {decomp_json};
+  const saliencyFig = {saliency_json};
+  const framePairs = {frames_json};
+
+  Plotly.newPlot('fig-timeline', timelineFig.data, timelineFig.layout);
+  Plotly.newPlot('fig-entropy', entropyFig.data, entropyFig.layout);
+  Plotly.newPlot('fig-accel', accelFig.data, accelFig.layout);
+  Plotly.newPlot('fig-decomp', decompFig.data, decompFig.layout);
+  Plotly.newPlot('fig-saliency', saliencyFig.data, saliencyFig.layout);
+
+  function attachFramePreview(divId, prevId, nextId) {{
+    const div = document.getElementById(divId);
+    const prevImg = document.getElementById(prevId);
+    const nextImg = document.getElementById(nextId);
+    if (!div || !prevImg || !nextImg || framePairs.length === 0) return;
+
+    function setFromIndex(idx) {{
+      if (idx == null) return;
+      const safeIdx = Math.max(0, Math.min(framePairs.length - 1, idx));
+      const pair = framePairs[safeIdx];
+      if (!pair) return;
+      prevImg.src = pair.prev;
+      nextImg.src = pair.next;
+    }}
+
+    setFromIndex(0);
+    div.on('plotly_hover', (ev) => {{ const idx = ev?.points?.[0]?.pointIndex; setFromIndex(idx); }});
+    div.on('plotly_click', (ev) => {{ const idx = ev?.points?.[0]?.pointIndex; setFromIndex(idx); }});
+  }}
+
+  attachFramePreview('fig-timeline', 'timeline-prev', 'timeline-next');
+  attachFramePreview('fig-entropy', 'entropy-prev', 'entropy-next');
+  attachFramePreview('fig-accel', 'accel-prev', 'accel-next');
+  attachFramePreview('fig-decomp', 'decomp-prev', 'decomp-next');
+</script>
+
 </body>
 </html>
-""".format(
-            video=video_path,
-            mean_motion=float(np.nanmean(metrics.mean_motion)),
-            p95_motion=float(np.nanmean(metrics.p95_motion)),
-            entropy=float(np.nanmean(metrics.entropy)),
-            ratio=metrics.residual_ratio,
-        )
+"""
+
+    output_html.write_text(html, encoding="utf-8")
+
+
+def show_interactive_plots(metrics: MotionMetrics) -> None:
+    pio.renderers.default = "browser"
+
+    figs = [
+        plot_motion_timeline(metrics),
+        plot_entropy(metrics),
+        plot_acceleration(metrics),
+        plot_camera_vs_object(metrics),
+        plot_saliency_map(metrics),
     ]
 
-    def to_json_obj(obj: go.Figure) -> str:
-        return json.dumps(obj, cls=PlotlyJSONEncoder)
-
-    parts.append(
-        "<script>"
-        + "const timelineFig = "
-        + to_json_obj(fig_timeline)
-        + ";const entropyFig = "
-        + to_json_obj(fig_entropy)
-        + ";const accelFig = "
-        + to_json_obj(fig_accel)
-        + ";const decompFig = "
-        + to_json_obj(fig_decomp)
-        + ";const saliencyFig = "
-        + to_json_obj(fig_saliency)
-        + ";"
-        + "Plotly.newPlot('timeline', timelineFig.data, timelineFig.layout);"
-        + "Plotly.newPlot('entropy', entropyFig.data, entropyFig.layout);"
-        + "Plotly.newPlot('accel', accelFig.data, accelFig.layout);"
-        + "Plotly.newPlot('decomp', decompFig.data, decompFig.layout);"
-        + "Plotly.newPlot('saliency', saliencyFig.data, saliencyFig.layout);"
-        + "</script>"
-    )
-
-    output_html.write_text("\n".join(parts), encoding="utf-8")
+    for fig in figs:
+        fig.show()
 
 
 def main() -> None:
     args = parse_args()
     frames, fps = read_and_resample_video(args.video_path, args.target_fps, args.width, args.height)
     flows, _ = compute_dense_flow(frames)
-    metrics = aggregate_motion_metrics(flows, fps)
-    generate_report(metrics, args.video_path, args.output_html)
+    metrics = aggregate_motion_metrics(flows, fps, grid_size=(16, 9))
+    generate_report(metrics, frames, args.video_path, args.output_html)
     print(f"Готово: отчёт сохранён в {args.output_html}")
 
 
