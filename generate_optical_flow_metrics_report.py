@@ -334,11 +334,11 @@ def generate_report(metrics: MotionMetrics, video_path: Path, output_html: Path)
   <title>Оптический поток — аналитический отчёт</title>
   <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.55; margin: 32px; }
-    h1, h2, h3 { margin-top: 1.2em; }
-    .metric { background: #f5f7fb; padding: 12px 16px; border-radius: 8px; margin: 8px 0; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
-    .code { font-family: 'SFMono-Regular', Consolas, monospace; }
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.55; margin: 32px; }}
+    h1, h2, h3 {{ margin-top: 1.2em; }}
+    .metric {{ background: #f5f7fb; padding: 12px 16px; border-radius: 8px; margin: 8px 0; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }}
+    .code {{ font-family: 'SFMono-Regular', Consolas, monospace; }}
   </style>
 </head>
 <body>
