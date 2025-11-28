@@ -348,7 +348,10 @@ def plot_saliency_map(metrics: MotionMetrics) -> go.Figure:
         xaxis_title="Нормированная ширина",
         yaxis_title="Нормированная высота",
         template="plotly_white",
+        width=720,
+        height=405,
     )
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
     return fig
 
 
@@ -402,9 +405,10 @@ def generate_report(metrics: MotionMetrics, frames: List[np.ndarray], video_path
     h2 {{ margin-top: 1.4em; }}
     h3 {{ margin-top: 1.1em; }}
     .metric {{ background:#f5f7fb; padding:12px 16px; border-radius:8px; margin:6px 0; }}
-    .frame-pair {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin: 12px 0 32px; align-items: start; }}
-    .frame-pair img {{ width: 100%; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.08); background: #111; }}
+    .frame-pair {{ display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0 32px; align-items: flex-start; }}
+    .frame-pair img {{ width: 240px; max-width: 100%; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.08); background: #111; object-fit: contain; }}
     .frame-caption {{ font-size: 14px; color: #444; margin: 4px 0 0 0; }}
+    #fig-saliency {{ max-width: 760px; margin: 0 auto; }}
   </style>
 </head>
 <body>
