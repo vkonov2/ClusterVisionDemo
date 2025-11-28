@@ -356,50 +356,90 @@ def plot_saliency_map(metrics: MotionMetrics) -> go.Figure:
     return fig
 
 
-def encode_frame(frame: np.ndarray) -> str:
+def encode_frame(frame: np.ndarray, jpeg_quality: int = 80) -> str:
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    success, buffer = cv2.imencode(".jpg", rgb, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    success, buffer = cv2.imencode(".jpg", rgb, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
     if not success:
         raise RuntimeError("Не удалось закодировать кадр в JPEG")
     b64 = base64.b64encode(buffer).decode("ascii")
     return f"data:image/jpeg;base64,{b64}"
 
 
-def make_frame_pairs(frames: List[np.ndarray]) -> List[dict]:
+def make_frame_pairs(
+    frames: List[np.ndarray],
+    max_pairs: int = 200,
+    preview_size: Tuple[int, int] = (192, 108),
+    jpeg_quality: int = 70,
+) -> dict:
+    total_pairs = len(frames) - 1
+    if total_pairs <= 0:
+        return {"indices": [], "data": []}
+
+    stride = max(1, total_pairs // max_pairs)
+    indices = list(range(0, total_pairs, stride))
+    if indices[-1] != total_pairs - 1:
+        indices.append(total_pairs - 1)
+
     pairs = []
-    for idx in range(len(frames) - 1):
-        pairs.append({"prev": encode_frame(frames[idx]), "next": encode_frame(frames[idx + 1])})
-    return pairs
+    for idx in indices:
+        prev = cv2.resize(frames[idx], preview_size, interpolation=cv2.INTER_AREA)
+        nxt = cv2.resize(frames[idx + 1], preview_size, interpolation=cv2.INTER_AREA)
+        pairs.append({"prev": encode_frame(prev, jpeg_quality), "next": encode_frame(nxt, jpeg_quality)})
+
+    return {"indices": indices, "data": pairs}
 
 
-def plot_flow_heatmap_sequence(flows: List[np.ndarray], fps: float) -> go.Figure:
+def plot_flow_heatmap_sequence(
+    flows: List[np.ndarray],
+    fps: float,
+    max_frames: int = 150,
+    heatmap_size: Tuple[int, int] = (96, 54),
+) -> go.Figure:
     if not flows:
         raise ValueError("Нет данных оптического потока для построения тепловых карт")
 
-    mags = [np.linalg.norm(flow, axis=2) for flow in flows]
-    base_mag = mags[0]
-    times = np.arange(len(flows)) / (fps or 1.0)
+    stride = max(1, len(flows) // max_frames)
+    selected_indices = list(range(0, len(flows), stride))
+    if selected_indices[-1] != len(flows) - 1:
+        selected_indices.append(len(flows) - 1)
 
-    frames = [
-        go.Frame(
-            data=[go.Heatmap(z=mag, colorscale="Turbo", showscale=False)],
-            name=str(idx),
+    mags = [np.linalg.norm(flows[idx], axis=2) for idx in selected_indices]
+    resized = [cv2.resize(mag, heatmap_size, interpolation=cv2.INTER_AREA) for mag in mags]
+    base_mag = resized[0]
+
+    slider_steps = []
+    frames = []
+    for mag, src_idx in zip(resized, selected_indices):
+        slider_steps.append(
+            {
+                "args": [[str(src_idx)], {"frame": {"duration": int(1000 / fps), "redraw": True}, "mode": "immediate"}],
+                "label": f"{src_idx}",
+                "value": str(src_idx),
+            }
         )
-        for idx, mag in enumerate(mags)
-    ]
-
-    slider_steps = [
-        {
-            "label": f"{idx} ({t:.2f} с)",
-            "method": "animate",
-            "args": [[str(idx)], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}],
-            "value": idx,
-        }
-        for idx, t in enumerate(times)
-    ]
+        frames.append(
+            go.Frame(
+                name=str(src_idx),
+                data=[
+                    go.Heatmap(
+                        z=mag,
+                        colorscale="Turbo",
+                        colorbar=dict(title="|F|", len=0.8),
+                        zsmooth=False,
+                    )
+                ],
+            )
+        )
 
     fig = go.Figure(
-        data=[go.Heatmap(z=base_mag, colorscale="Turbo", colorbar_title="|F|, пикс/кадр")],
+        data=[
+            go.Heatmap(
+                z=base_mag,
+                colorscale="Turbo",
+                colorbar=dict(title="|F|", len=0.8),
+                zsmooth=False,
+            )
+        ],
         frames=frames,
     )
     fig.update_layout(
@@ -597,12 +637,28 @@ def generate_report(
     const div = document.getElementById(divId);
     const prevImg = document.getElementById(prevId);
     const nextImg = document.getElementById(nextId);
-    if (!div || !prevImg || !nextImg || framePairs.length === 0) return;
+    if (!div || !prevImg || !nextImg || !framePairs.data || framePairs.data.length === 0) return;
+
+    function nearestPreviewIndex(idx) {{
+      if (idx == null || Number.isNaN(idx)) return null;
+      let bestIdx = 0;
+      let bestDiff = Infinity;
+      for (let i = 0; i < framePairs.indices.length; i++) {{
+        const diff = Math.abs(framePairs.indices[i] - idx);
+        if (diff < bestDiff) {{
+          bestDiff = diff;
+          bestIdx = i;
+        }}
+      }}
+      return bestIdx;
+    }}
 
     function setFromIndex(idx) {{
       if (idx == null) return;
-      const safeIdx = Math.max(0, Math.min(framePairs.length - 1, idx));
-      const pair = framePairs[safeIdx];
+      const nearest = nearestPreviewIndex(idx);
+      if (nearest == null) return;
+      const safeIdx = Math.max(0, Math.min(framePairs.data.length - 1, nearest));
+      const pair = framePairs.data[safeIdx];
       if (!pair) return;
       prevImg.src = pair.prev;
       nextImg.src = pair.next;
