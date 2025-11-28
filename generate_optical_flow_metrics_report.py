@@ -352,7 +352,7 @@ def plot_saliency_map(metrics: MotionMetrics) -> go.Figure:
         width=720,
         height=405,
     )
-    fig.update_yaxes(scaleanchor="x", scaleratio=1)
+    fig.update_yaxes(scaleanchor="x", scaleratio=1, autorange="reversed")
     return fig
 
 
@@ -368,7 +368,7 @@ def encode_frame(frame: np.ndarray, jpeg_quality: int = 80) -> str:
 def make_frame_pairs(
     frames: List[np.ndarray],
     max_pairs: int = 200,
-    preview_size: Tuple[int, int] = (192, 108),
+    preview_size: Tuple[int, int] = (256, 144),
     jpeg_quality: int = 70,
 ) -> dict:
     total_pairs = len(frames) - 1
@@ -412,9 +412,17 @@ def plot_flow_heatmap_sequence(
     for mag, src_idx in zip(resized, selected_indices):
         slider_steps.append(
             {
-                "args": [[str(src_idx)], {"frame": {"duration": int(1000 / fps), "redraw": True}, "mode": "immediate"}],
+                "args": [
+                    [str(src_idx)],
+                    {
+                        "frame": {"duration": int(1000 / fps), "redraw": True},
+                        "mode": "immediate",
+                        "transition": {"duration": 0},
+                    },
+                ],
                 "label": f"{src_idx}",
                 "value": str(src_idx),
+                "method": "animate",
             }
         )
         frames.append(
@@ -447,13 +455,16 @@ def plot_flow_heatmap_sequence(
         width=720,
         height=405,
         xaxis=dict(title="Ширина (пиксели)", visible=False),
-        yaxis=dict(title="Высота (пиксели)", scaleanchor="x", scaleratio=1, visible=False),
+        yaxis=dict(
+            title="Высота (пиксели)", scaleanchor="x", scaleratio=1, visible=False, autorange="reversed"
+        ),
         sliders=[
             {
                 "active": 0,
                 "currentvalue": {"prefix": "Пара кадров: "},
                 "steps": slider_steps,
                 "pad": {"l": 30, "r": 30, "t": 25, "b": 10},
+                "transition": {"duration": 0},
             }
         ],
         updatemenus=[
@@ -523,11 +534,11 @@ def generate_report(
     h2 {{ margin-top: 1.4em; }}
     h3 {{ margin-top: 1.1em; }}
     .metric {{ background:#f5f7fb; padding:12px 16px; border-radius:8px; margin:6px 0; }}
-    .frame-pair {{ display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0 32px; align-items: flex-start; }}
-    .frame-pair img {{ width: 200px; max-width: 100%; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.08); background: #111; object-fit: contain; }}
+    .frame-pair {{ display: flex; flex-wrap: wrap; gap: 16px; margin: 12px 0 32px; align-items: flex-start; justify-content: center; }}
+    .frame-pair img {{ width: 260px; max-width: 100%; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.08); background: #111; object-fit: contain; }}
     .frame-caption {{ font-size: 14px; color: #444; margin: 4px 0 0 0; }}
-    #fig-saliency {{ max-width: 760px; margin: 0 auto; }}
-    #fig-heatmaps {{ max-width: 760px; margin: 0 auto; }}
+    #fig-saliency {{ max-width: 820px; margin: 0 auto; }}
+    #fig-heatmaps {{ max-width: 820px; margin: 0 auto; }}
   </style>
 </head>
 <body>
@@ -631,7 +642,9 @@ def generate_report(
   Plotly.newPlot('fig-accel', accelFig.data, accelFig.layout);
   Plotly.newPlot('fig-decomp', decompFig.data, decompFig.layout);
   Plotly.newPlot('fig-saliency', saliencyFig.data, saliencyFig.layout);
-  Plotly.newPlot('fig-heatmaps', heatmapFig.data, heatmapFig.layout).then((g) => Plotly.addFrames(g, heatmapFig.frames));
+  Plotly.newPlot('fig-heatmaps', heatmapFig.data, heatmapFig.layout, {}, heatmapFig.frames).then((g) => {
+    Plotly.addFrames(g, heatmapFig.frames);
+  });
 
   function attachFramePreview(divId, prevId, nextId, useSlider = false) {{
     const div = document.getElementById(divId);
