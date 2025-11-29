@@ -642,9 +642,9 @@ def generate_report(
   Plotly.newPlot('fig-accel', accelFig.data, accelFig.layout);
   Plotly.newPlot('fig-decomp', decompFig.data, decompFig.layout);
   Plotly.newPlot('fig-saliency', saliencyFig.data, saliencyFig.layout);
-  Plotly.newPlot('fig-heatmaps', heatmapFig.data, heatmapFig.layout, {}, heatmapFig.frames).then((g) => {
+  Plotly.newPlot('fig-heatmaps', heatmapFig.data, heatmapFig.layout, {{}}, heatmapFig.frames).then((g) => {{
     Plotly.addFrames(g, heatmapFig.frames);
-  });
+  }});
 
   function attachFramePreview(divId, prevId, nextId, useSlider = false) {{
     const div = document.getElementById(divId);
