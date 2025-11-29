@@ -27,11 +27,16 @@ DEFAULT_FRAMES = 16
 
 
 def _get_device() -> str:
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def _get_dtype() -> torch.dtype:
-    return torch.float16 if torch.cuda.is_available() else torch.float32
+    device = _get_device()
+    return torch.float16 if device in {"cuda", "mps"} else torch.float32
 
 
 @lru_cache(maxsize=1)
@@ -80,13 +85,13 @@ def _read_video_pyav(container: av.container.input.InputContainer, indices: Sequ
 def sample_video_frames(video_path: str, num_frames: int = DEFAULT_FRAMES) -> Tuple[np.ndarray, int]:
     """Load a video file and sample evenly spaced frames."""
 
-    container = av.open(video_path)
-    total_frames = container.streams.video[0].frames
-    if total_frames == 0:
-        raise ValueError("Видео не содержит кадров")
+    with av.open(video_path) as container:
+        total_frames = container.streams.video[0].frames
+        if total_frames == 0:
+            raise ValueError("Видео не содержит кадров")
 
-    indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-    clip = _read_video_pyav(container, indices)
+        indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+        clip = _read_video_pyav(container, indices)
     return clip, int(total_frames)
 
 
@@ -223,7 +228,7 @@ def main():
     args = parser.parse_args()
 
     demo = build_demo()
-    demo.queue().launch(share=args.share, server_port=args.server_port)
+    demo.queue(concurrency_count=1).launch(share=args.share, server_port=args.server_port)
 
 
 if __name__ == "__main__":
