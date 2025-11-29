@@ -12,6 +12,7 @@ import argparse
 import os
 from functools import lru_cache
 from typing import List, Sequence, Tuple
+import inspect
 
 import av
 import gradio as gr
@@ -228,7 +229,15 @@ def main():
     args = parser.parse_args()
 
     demo = build_demo()
-    demo.queue(concurrency_count=1).launch(share=args.share, server_port=args.server_port)
+
+    queue_kwargs = {}
+    queue_signature = inspect.signature(demo.queue)
+    if "concurrency_count" in queue_signature.parameters:
+        queue_kwargs["concurrency_count"] = 1
+    elif "default_concurrency_limit" in queue_signature.parameters:
+        queue_kwargs["default_concurrency_limit"] = 1
+
+    demo.queue(**queue_kwargs).launch(share=args.share, server_port=args.server_port)
 
 
 if __name__ == "__main__":
