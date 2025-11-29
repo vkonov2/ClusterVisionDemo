@@ -3,7 +3,7 @@ FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=0 \
     GRADIO_SERVER_NAME=0.0.0.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

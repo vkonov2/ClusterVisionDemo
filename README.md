@@ -94,6 +94,7 @@ The repository now includes a minimal Docker setup for the LLaVA video chat GUI.
    ```
 
 > To persist Hugging Face caches between runs, create a local `hf-cache/` directory and uncomment the volume mapping in `docker-compose.yml`.
+> The Docker setup disables Hugging Face's `hf_transfer` fast-download path by default to avoid requiring the extra `hf_transfer` package; set `HF_HUB_ENABLE_HF_TRANSFER=1` and install `hf_transfer` if you prefer the accelerated downloader.
 
 
 ## Suggestions for a good README
