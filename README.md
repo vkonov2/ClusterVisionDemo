@@ -68,6 +68,33 @@ Use the built-in continuous integration in GitLab.
 
 ***
 
+## Run `llava_video_gui.py` with Docker
+
+The repository now includes a minimal Docker setup for the LLaVA video chat GUI.
+
+1. Clean up any previous containers and images for this service:
+   ```bash
+   docker compose -f docker-compose.yml down --rmi local --remove-orphans
+   ```
+2. Build a fresh image (pulling updated base layers):
+   ```bash
+   docker compose -f docker-compose.yml build --pull
+   ```
+3. Start the GUI (listens on http://localhost:7860 by default):
+   ```bash
+   docker compose -f docker-compose.yml up --detach
+   ```
+4. Follow logs if needed:
+   ```bash
+   docker compose -f docker-compose.yml logs -f
+   ```
+5. Stop and remove resources when finished:
+   ```bash
+   docker compose -f docker-compose.yml down --rmi local --remove-orphans
+   ```
+
+> To persist Hugging Face caches between runs, create a local `hf-cache/` directory and uncomment the volume mapping in `docker-compose.yml`.
+
 
 ## Suggestions for a good README
 
