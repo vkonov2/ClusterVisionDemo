@@ -42,7 +42,7 @@ def load_model() -> Tuple[LlavaNextVideoForConditionalGeneration, LlavaNextVideo
     dtype = _get_dtype()
     model = LlavaNextVideoForConditionalGeneration.from_pretrained(
         MODEL_ID,
-        torch_dtype=dtype,
+        dtype=dtype,
         low_cpu_mem_usage=True,
         device_map="auto" if device == "cuda" else None,
     )
