@@ -12,6 +12,7 @@ av
 pandas
 tqdm
 boltons
+gradio>=4.39.0
 yt-dlp
 openpyxl
 scikit-learn
