@@ -1,7 +1,8 @@
 """Gradio интерфейс для Video-LLaMA с расширенным логированием.
 
-Скрипт пытается загрузить модель из репозитория Video-LLaMA, но сохраняет
-рабочий режим через резервный упрощённый чат, если зависимости недоступны.
+Скрипт ожидает установленную оригинальную модель Video-LLaMA. Если зависимости
+не найдены, загрузка завершается с ошибкой и подробным сообщением, чтобы
+пользователь установил модель корректно.
 
 Особенности:
 - Левая колонка: загрузка видео, плеер и поток логов.
@@ -10,6 +11,8 @@
 """
 from __future__ import annotations
 
+import importlib
+import os
 import shutil
 import sys
 import tempfile
@@ -58,36 +61,11 @@ class SessionState:
     history: List[Tuple[str, str]] = field(default_factory=list)
 
 
-class DummyVideoLLaMAModel:
-    """Упрощённая заглушка для сценариев без установленной Video-LLaMA."""
-
-    def __init__(self):
-        logger.warning(
-            "Используется резервный режим: пакет Video-LLaMA не найден. "
-            "Установите оригинальную модель для реальных ответов."
-        )
-
-    def prepare_video(self, video_path: Path) -> str:
-        logger.info("Начало подготовки видео %s", video_path)
-        # В реальной модели здесь извлекаются признаки видео.
-        token = video_path.stem
-        logger.success("Видео подготовлено (token=%s)", token)
-        return token
-
-    def chat(self, message: str, history: List[Tuple[str, str]], video_token: str) -> str:
-        logger.debug("Генерация ответа в резервном режиме для токена %s", video_token)
-        context = " ".join(user for user, _ in history[-2:])
-        return (
-            "[DEMO] Реальная модель не загружена. Я получил вопрос: "
-            f"'{message}'. Ранее вы спрашивали: '{context}'. "
-            "Установите Video-LLaMA для полноценных ответов."
-        )
-
-
 class VideoLLaMALoader:
     """Менеджер загрузки модели Video-LLaMA.
 
-    Если зависимости недоступны, используется DummyVideoLLaMAModel.
+    Если зависимости недоступны, процесс завершается с подсказкой по установке
+    реальной модели, чтобы избежать «тихого» резервного режима.
     """
 
     def __init__(self, model_root: Optional[str] = None):
@@ -95,12 +73,18 @@ class VideoLLaMALoader:
         self.model = self._load_model()
 
     def _load_model(self):
-        try:
-            # Попытка загрузить модель из установленного пакета Video-LLaMA.
-            # Конкретный API может отличаться, поэтому импорт обёрнут в try/except.
-            from videollama.model.builder import load_pretrained_model  # type: ignore
-            from videollama.eval.run_llava import eval_model  # type: ignore
+        if importlib.util.find_spec("videollama") is None:
+            raise RuntimeError(
+                "Пакет videollama не найден. Установите репозиторий Video-LLaMA по инструкции docs/video_llama_setup.md"
+            )
 
+        # Импорты выносим без try/except, чтобы отсутствие зависимостей сразу падало с понятной ошибкой.
+        load_pretrained_model = importlib.import_module(
+            "videollama.model.builder"
+        ).load_pretrained_model  # type: ignore[attr-defined]
+        eval_model = importlib.import_module("videollama.eval.run_llava").eval_model  # type: ignore[attr-defined]
+
+        try:
             logger.info("Обнаружен пакет Video-LLaMA, начинаем загрузку модели")
             model_path = str(self.model_root) if self.model_root else None
             # Подставьте нужный идентификатор модели из README проекта.
@@ -129,12 +113,13 @@ class VideoLLaMALoader:
                         video_token,
                         len(history),
                     )
+                    video_path = Path(video_token)
                     conversation = eval_model(
                         model=self.model,
                         tokenizer=self.tokenizer,
                         video=None,
                         image=None,
-                        video_path=str(video_path) if (video_path := Path(video_token)).exists() else None,
+                        video_path=str(video_path) if video_path.exists() else None,
                         question=message,
                         do_sample=True,
                     )
@@ -149,8 +134,12 @@ class VideoLLaMALoader:
             logger.success("Модель Video-LLaMA загружена")
             return RealVideoLLaMAWrapper()
         except Exception as exc:  # pragma: no cover - падение загрузки
-            logger.error("Не удалось загрузить Video-LLaMA: %s", exc)
-            return DummyVideoLLaMAModel()
+            hint = (
+                "Video-LLaMA не установлена или модель не скачана. "
+                "Установите зависимости и веса, затем запустите приложение снова."
+            )
+            logger.exception("Не удалось загрузить Video-LLaMA: %s", exc)
+            raise RuntimeError(hint) from exc
 
     def prepare_video(self, video_path: Path) -> str:
         return self.model.prepare_video(video_path)
@@ -233,7 +222,10 @@ def get_loader() -> VideoLLaMALoader:
     global _loader_instance
     if _loader_instance is None:
         logger.info("Инициализация загрузчика Video-LLaMA")
-        _loader_instance = VideoLLaMALoader()
+        model_root = os.getenv("VIDEO_LLAMA_MODEL_ROOT")
+        if model_root:
+            logger.info("Используется путь к модели из VIDEO_LLAMA_MODEL_ROOT: %s", model_root)
+        _loader_instance = VideoLLaMALoader(model_root=model_root)
     return _loader_instance
 
 
