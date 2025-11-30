@@ -1,0 +1,8 @@
+# Minimal dependencies to run llava_video_gui.py
+numpy
+pillow
+av
+transformers>=4.41.0
+sentencepiece>=0.1.99
+torch==2.3.1
+gradio>=4.39.0

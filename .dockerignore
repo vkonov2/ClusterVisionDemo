@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.o
+*.a
+*.log
+*.tmp
+*.swp
+.cache/
+.venv/
+.env
+.git
+.gitignore
+*.ipynb
