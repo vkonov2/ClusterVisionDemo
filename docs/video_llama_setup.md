@@ -1,24 +1,33 @@
 # Настройка Video-LLaMA для работы с `video_llama_gradio_app.py`
 
-Приложение больше не использует заглушку: если модель не установлена, загрузка завершится ошибкой. Ниже — пошаговый порядок, как подготовить среду с настоящей Video-LLaMA на macOS или Linux.
+Приложение больше не использует заглушку: если модель не установлена, загрузка завершится ошибкой. Ниже — пошаговый порядок, как подготовить среду с настоящей Video-LLaMA на macOS или Linux. Все команды выполняйте **внутри вашего виртуального окружения**, чтобы ничего не ставить в глобальный Python.
 
 ## 1. Подготовка окружения
 - Установите Python 3.10–3.12 и `ffmpeg` (на macOS: `brew install ffmpeg`).
 - Создайте виртуальное окружение и активируйте его.
 - Установите зависимости проекта: `pip install -r requirements.txt`.
+  Если окружение ещё не создано, пример (macOS/Linux):
+
+  ```bash
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install --upgrade pip
+  pip install -r requirements.txt
+  ```
 
 ## 2. Установка зависимостей Video-LLaMA
 Video-LLaMA использует CUDA для ускорения. На macOS без GPU расчёты будут очень медленными или невозможными; для полноценных результатов предпочтительна машина с NVIDIA GPU и установленным CUDA.
 
 ```bash
-# Клонируйте оригинальный репозиторий
+# Клонируйте оригинальный репозиторий рядом с проектом (не в глобальный Python)
+cd /Users/konov/projects  # пример каталога, где лежит ClusterVisionDemo
 git clone https://github.com/DAMO-NLP-SG/Video-LLaMA.git
-cd Video-LLaMA
 
-# Установите требования самой модели
+# Перейдите в репозиторий и установите зависимости МОДЕЛИ в том же venv
+cd Video-LLaMA
 pip install -r requirements.txt
 
-# Установите сам пакет (чтобы python видел модуль `videollama`)
+# Поставьте пакет в editable-режиме, чтобы модуль `videollama` был доступен
 pip install -e .
 ```
 
@@ -47,8 +56,18 @@ python video_llama_gradio_app.py
 
 3. **Если модуль не находится в PYTHONPATH** — передайте путь к клонированному репозиторию в `VIDEO_LLAMA_REPO`, чтобы загрузчик добавил его в `sys.path`:
 
+ ```bash
+ export VIDEO_LLAMA_REPO=/absolute/path/to/Video-LLaMA
+ python video_llama_gradio_app.py
+ ```
+
+Полный пример запуска в venv на macOS, если проект в `/Users/konov/projects/ClusterVisionDemo` и репозиторий модели в `/Users/konov/projects/Video-LLaMA`:
+
 ```bash
-export VIDEO_LLAMA_REPO=/absolute/path/to/Video-LLaMA
+cd /Users/konov/projects/ClusterVisionDemo
+source .venv/bin/activate
+export VIDEO_LLAMA_MODEL_ROOT=/Users/konov/projects/ClusterVisionDemo/checkpoints/VideoLLaMA-7B
+export VIDEO_LLAMA_REPO=/Users/konov/projects/Video-LLaMA
 python video_llama_gradio_app.py
 ```
 
