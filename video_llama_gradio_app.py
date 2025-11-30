@@ -73,9 +73,19 @@ class VideoLLaMALoader:
         self.model = self._load_model()
 
     def _load_model(self):
+        repo_hint = os.getenv("VIDEO_LLAMA_REPO")
+        if importlib.util.find_spec("videollama") is None and repo_hint:
+            repo_path = Path(repo_hint).expanduser().resolve()
+            logger.info("videollama не найден в окружении, пробуем путь VIDEO_LLAMA_REPO=%s", repo_path)
+            if repo_path.exists():
+                sys.path.append(str(repo_path))
+            else:
+                logger.warning("Путь VIDEO_LLAMA_REPO не существует: %s", repo_path)
+
         if importlib.util.find_spec("videollama") is None:
             raise RuntimeError(
-                "Пакет videollama не найден. Установите репозиторий Video-LLaMA по инструкции docs/video_llama_setup.md"
+                "Пакет videollama не найден. Установите репозиторий Video-LLaMA или передайте путь в VIDEO_LLAMA_REPO "
+                "(см. docs/video_llama_setup.md)"
             )
 
         # Импорты выносим без try/except, чтобы отсутствие зависимостей сразу падало с понятной ошибкой.

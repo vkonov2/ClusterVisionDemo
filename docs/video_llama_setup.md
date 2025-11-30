@@ -17,6 +17,9 @@ cd Video-LLaMA
 
 # Установите требования самой модели
 pip install -r requirements.txt
+
+# Установите сам пакет (чтобы python видел модуль `videollama`)
+pip install -e .
 ```
 
 Если в процессе потребуются дополнительные системные пакеты (например, `ffmpeg` или `xformers`), установите их согласно README репозитория.
@@ -35,10 +38,17 @@ huggingface-cli download DAMO-NLP-SG/VideoLLaMA-7B --local-dir ./checkpoints/Vid
 `video_llama_gradio_app.py` автоматически вызывает `load_pretrained_model` без заглушек. Чтобы приложение увидело веса, есть два варианта:
 
 1. **Использовать стандартный идентификатор** — оставить значение по умолчанию `DAMO-NLP-SG/VideoLLaMA-7B`, если веса доступны локально через `huggingface_hub`.
-2. **Указать локальный путь** — передать путь к чекпоинту в переменной окружения `VIDEO_LLAMA_MODEL_ROOT` при запуске:
+2. **Указать локальный путь к весам** — передать путь к чекпоинту в переменной окружения `VIDEO_LLAMA_MODEL_ROOT` при запуске:
 
 ```bash
 export VIDEO_LLAMA_MODEL_ROOT=/absolute/path/to/Video-LLaMA/checkpoints/VideoLLaMA-7B
+python video_llama_gradio_app.py
+```
+
+3. **Если модуль не находится в PYTHONPATH** — передайте путь к клонированному репозиторию в `VIDEO_LLAMA_REPO`, чтобы загрузчик добавил его в `sys.path`:
+
+```bash
+export VIDEO_LLAMA_REPO=/absolute/path/to/Video-LLaMA
 python video_llama_gradio_app.py
 ```
 
