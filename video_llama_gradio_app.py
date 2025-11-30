@@ -184,7 +184,7 @@ def handle_video_upload(temp_video, state: SessionState):
         saved_path = _persist_video(temp_video)
     except Exception as exc:
         logger.exception("Не удалось сохранить видео: %s", exc)
-        return gr.Video.update(), ui_log_sink.to_text(), state, state.history
+        return gr.update(), ui_log_sink.to_text(), state, state.history
 
     state.video_path = str(saved_path)
     loader = get_loader()
@@ -193,7 +193,7 @@ def handle_video_upload(temp_video, state: SessionState):
     state.history = []
     logger.info("Видео %s готово к диалогу", saved_path.name)
     return (
-        gr.Video.update(value=str(saved_path)),
+        gr.update(value=str(saved_path)),
         ui_log_sink.to_text(),
         state,
         [],
@@ -252,7 +252,7 @@ def build_interface():
                     label="Логи", lines=12, interactive=False, value=ui_log_sink.to_text()
                 )
 
-            with gr.Column(scale=1.2, min_width=500):
+            with gr.Column(scale=2, min_width=500):
                 gr.Markdown("## Диалог")
                 chatbot = gr.Chatbot(label="Ответы Video-LLaMA", height=520)
                 user_message = gr.Textbox(label="Ваш вопрос", placeholder="Спросите о содержании видео...")
