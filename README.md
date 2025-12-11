@@ -1,5 +1,9 @@
 # SynapSight SaaS Main
 
+## Video-LLaMA чат (Gradio)
+
+Для запуска `video_llama_gradio_app.py` требуется установить оригинальную модель Video-LLaMA и скачать веса. Подробные шаги: `docs/video_llama_setup.md`.
+
 ## Getting started
 
 Compose up:

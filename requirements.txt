@@ -22,6 +22,8 @@ requests
 ultralytics>=8.2.0
 yacs>=0.1.8
 pytesseract
+gradio>=4.0.0
+loguru>=0.7.0
 
 # --- Аудио + YAMNet ---
 tensorflow>=2.15.0
