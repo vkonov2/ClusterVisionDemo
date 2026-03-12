@@ -60,7 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--video",
         required=False,
-        default=Path("data/videos/000-youtube.mp4"),
+        # default=Path("data/videos/000-youtube.mp4"),
+        default=Path("/Users/konov/Downloads/synapsight/rsa_test.mp4"),
         type=Path,
         help="Path to the video file (recommend <= ~1 minute, GPU ~24GB).",
     )
